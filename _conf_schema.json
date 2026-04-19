@@ -1,29 +1,30 @@
 {
-    "github_token": {
-        "description": "GitHub Personal Access Token，用于创建issue",
-        "hint": "需要具有仓库管理权限的token，在GitHub设置中生成",
-        "type": "string",
-        "default": ""
-    },
-    "trigger_keyword": {
-        "description": "触发创建issue的关键字",
-        "type": "string",
-        "default": "issue"
-    },
-    "require_at_bot": {
-        "description": "是否要求@机器人才能触发",
-        "type": "bool",
-        "default": true
-    },
-    "repo_bindings": {
-        "description": "群组与GitHub仓库的绑定关系",
-        "hint": "每行一条，格式为 群组ID=owner/repo，例如: 12345=username/project",
-        "type": "list",
-        "default": []
-    },
-    "llm_extract_prompt": {
-        "description": "LLM用于提取信息的提示词模板",
-        "type": "string",
-        "default": "请分析以下消息内容，提取出BUG报告或功能请求的关键信息，包括：标题、详细描述、复现步骤（如果是BUG）、期望行为等。请用markdown格式输出。"
-    }
+  "github_token": {
+    "description": "GitHub Personal Access Token",
+    "type": "string",
+    "default": "",
+    "hint": "需要 repo 权限的 token，在 GitHub Settings → Developer settings → Personal access tokens 生成"
+  },
+  "trigger_keyword": {
+    "description": "触发创建 issue 的关键字",
+    "type": "string",
+    "default": "issue"
+  },
+  "require_at_bot": {
+    "description": "是否要求 @机器人 才能触发",
+    "type": "bool",
+    "default": true
+  },
+  "repo_bindings": {
+    "description": "群组与 GitHub 仓库的绑定",
+    "type": "list",
+    "default": [],
+    "hint": "每条格式: 群组ID=owner/repo，例如: 12345=username/project。也可通过 /bindrepo 命令动态绑定"
+  },
+  "llm_system_prompt": {
+    "description": "LLM 系统提示词",
+    "type": "text",
+    "default": "你是一个专业的 GitHub Issue 整理助手，负责将聊天记录中的问题或需求整理为结构清晰的 Issue 内容。",
+    "hint": "自定义 LLM 整理 issue 时使用的系统提示词。留空使用默认值"
+  }
 }
