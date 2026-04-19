@@ -41,7 +41,7 @@ class AutoIssuePlugin(Star):
     # ------------------------------------------------------------------ #
 
     @filter.event_message_type(filter.EventMessageType.ALL)
-    async def handle_message(self, event: AstrMessageEvent, *args, **kwargs):
+    async def handle_message(self, event, *args, **kwargs):
         """检测回复合并转发消息时触发 issue 创建"""
         # 检查触发关键字
         if self.trigger_keyword not in event.message_str:
@@ -318,7 +318,7 @@ class AutoIssuePlugin(Star):
     # ------------------------------------------------------------------ #
 
     @filter.command("bind_repo")
-    async def bind_repo(self, event: AstrMessageEvent, *args, **kwargs):
+    async def bind_repo(self, event, *args, **kwargs):
         """绑定当前群组到 GitHub 仓库：/bind_repo owner/repo"""
         args_str = ' '.join(args).strip()
         if not args_str:
@@ -347,7 +347,7 @@ class AutoIssuePlugin(Star):
         yield event.plain_result(f"✅ 群组 {group_id} 已绑定到仓库 {args_str}")
 
     @filter.command("unbind_repo")
-    async def unbind_repo(self, event: AstrMessageEvent, *args, **kwargs):
+    async def unbind_repo(self, event, *args, **kwargs):
         """解除当前群组的仓库绑定"""
         group_id = self._extract_group_id(event.session_id)
         if not group_id:
@@ -360,7 +360,7 @@ class AutoIssuePlugin(Star):
             yield event.plain_result(f"群组 {group_id} 没有绑定任何仓库")
 
     @filter.command("list_bindings")
-    async def list_bindings(self, event: AstrMessageEvent, *args, **kwargs):
+    async def list_bindings(self, event, *args, **kwargs):
         """列出所有群组仓库绑定"""
         if not self.repo_bindings:
             yield event.plain_result("当前没有任何群组仓库绑定")
@@ -371,7 +371,7 @@ class AutoIssuePlugin(Star):
         yield event.plain_result(text)
 
     @filter.command("issue_status")
-    async def issue_status(self, event: AstrMessageEvent, *args, **kwargs):
+    async def issue_status(self, event, *args, **kwargs):
         """查看插件状态"""
         group_id = self._extract_group_id(event.session_id)
         current_repo = self.repo_bindings.get(str(group_id), "未绑定") if group_id else "无法确定群组"
@@ -387,7 +387,7 @@ class AutoIssuePlugin(Star):
         )
 
     @filter.command("issue_help")
-    async def issue_help(self, event: AstrMessageEvent, *args, **kwargs):
+    async def issue_help(self, event, *args, **kwargs):
         """显示帮助信息"""
         yield event.plain_result(
             "📋 AutoIssue 插件使用说明\n\n"
