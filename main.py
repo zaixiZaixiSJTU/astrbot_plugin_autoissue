@@ -318,6 +318,7 @@ class AutoIssuePlugin(Star):
     # ------------------------------------------------------------------ #
 
     @filter.command("bind_repo")
+    @filter.permission_type(filter.PermissionType.ADMIN)
     async def bind_repo(self, event, *args, **kwargs):
         """绑定当前群组到 GitHub 仓库：/bind_repo owner/repo"""
         args_str = ' '.join(args).strip()
@@ -347,6 +348,7 @@ class AutoIssuePlugin(Star):
         yield event.plain_result(f"✅ 群组 {group_id} 已绑定到仓库 {args_str}")
 
     @filter.command("unbind_repo")
+    @filter.permission_type(filter.PermissionType.ADMIN)
     async def unbind_repo(self, event, *args, **kwargs):
         """解除当前群组的仓库绑定"""
         group_id = self._extract_group_id(event.session_id)
@@ -360,6 +362,7 @@ class AutoIssuePlugin(Star):
             yield event.plain_result(f"群组 {group_id} 没有绑定任何仓库")
 
     @filter.command("list_bindings")
+    @filter.permission_type(filter.PermissionType.ADMIN)
     async def list_bindings(self, event, *args, **kwargs):
         """列出所有群组仓库绑定"""
         if not self.repo_bindings:
@@ -371,6 +374,7 @@ class AutoIssuePlugin(Star):
         yield event.plain_result(text)
 
     @filter.command("issue_status")
+    @filter.permission_type(filter.PermissionType.ADMIN)
     async def issue_status(self, event, *args, **kwargs):
         """查看插件状态"""
         group_id = self._extract_group_id(event.session_id)
@@ -387,6 +391,7 @@ class AutoIssuePlugin(Star):
         )
 
     @filter.command("issue_help")
+    @filter.permission_type(filter.PermissionType.ADMIN)
     async def issue_help(self, event, *args, **kwargs):
         """显示帮助信息"""
         yield event.plain_result(
