@@ -1,0 +1,6 @@
+name: astrbot_plugin_autoissue # 插件唯一识别名
+display_name: 自动Issue插件 # 用于展示的名字
+desc: 自动从合并转发消息中提取信息并创建GitHub Issue # 插件简短描述
+version: v1.0.0 # 插件版本号
+author: Claude # 作者
+repo: https://github.com/zaixiZaixiSJTU/astrbot_plugin_autoissue
