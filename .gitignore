@@ -2,3 +2,4 @@ __pycache__/
 *.pyc
 *.pyo
 config_example.json
+repo_bindings.json

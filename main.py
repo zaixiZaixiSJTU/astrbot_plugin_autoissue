@@ -1,7 +1,9 @@
 """AstrBot AutoIssue Plugin"""
 
+import json
 import re
 import asyncio
+from pathlib import Path
 from typing import Optional
 
 import aiohttp
@@ -10,6 +12,26 @@ from astrbot.api import logger
 from astrbot.api.event import filter
 from astrbot.api.star import Context, Star, register
 from astrbot.api.message_components import At
+
+_BINDINGS_FILE = Path(__file__).parent / "repo_bindings.json"
+
+
+def _load_bindings() -> dict:
+    try:
+        if _BINDINGS_FILE.exists():
+            return json.loads(_BINDINGS_FILE.read_text(encoding="utf-8"))
+    except Exception as e:
+        logger.warning(f"AutoIssue: failed to load bindings: {e}")
+    return {}
+
+
+def _save_bindings(bindings: dict) -> None:
+    try:
+        _BINDINGS_FILE.write_text(
+            json.dumps(bindings, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+    except Exception as e:
+        logger.error(f"AutoIssue: failed to save bindings: {e}")
 
 
 @register(
@@ -26,13 +48,9 @@ class AutoIssuePlugin(Star):
         self.trigger_keyword: str = config.get("trigger_keyword", "issue")
         self.require_at_bot: bool = config.get("require_at_bot", True)
         self.llm_system_prompt: str = config.get("llm_system_prompt", "")
+        self.http_proxy: str = config.get("http_proxy", "") or None
 
-        raw: list = config.get("repo_bindings", [])
-        self.repo_bindings: dict = {}
-        for entry in raw:
-            if isinstance(entry, str) and "=" in entry:
-                gid, repo = entry.split("=", 1)
-                self.repo_bindings[gid.strip()] = repo.strip()
+        self.repo_bindings: dict = _load_bindings()
 
         logger.info(
             f"AutoIssue: init ok | token={'yes' if self.github_token else 'NO'} | "
@@ -48,21 +66,29 @@ class AutoIssuePlugin(Star):
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def on_message(self, event):
         msg_text: str = event.message_str or ""
+        logger.info(f"AutoIssue: on_message | msg={repr(msg_text)}")
         if self.trigger_keyword not in msg_text:
             return
         if self.require_at_bot:
             at_bot = False
             try:
+                self_id = str(event.message_obj.self_id)
                 for comp in event.message_obj.message:
-                    if isinstance(comp, At) and str(comp.target) == str(event.message_obj.self_id):
+                    if isinstance(comp, At) and str(comp.qq) == self_id:
                         at_bot = True
                         break
-            except Exception:
-                pass
+                if not at_bot:
+                    raw = event.message_obj.raw_message or ""
+                    if isinstance(raw, str) and f"qq={self_id}" in raw:
+                        at_bot = True
+            except Exception as e:
+                logger.warning(f"AutoIssue: at check error: {e}")
+            logger.info(f"AutoIssue: at_bot={at_bot} self_id={getattr(event.message_obj, 'self_id', '?')} comps={[(type(c).__name__, vars(c)) for c in event.message_obj.message]}")
             if not at_bot:
                 return
 
         group_id = self._extract_group_id(event.session_id)
+        logger.info(f"AutoIssue: group_id={group_id} bindings={self.repo_bindings}")
         if not group_id:
             return
 
@@ -73,7 +99,9 @@ class AutoIssuePlugin(Star):
             )
             return
 
-        if not self._is_reply(event):
+        is_reply = self._is_reply(event)
+        logger.info(f"AutoIssue: is_reply={is_reply}")
+        if not is_reply:
             yield event.plain_result("please reply to a (forwarded) message first")
             return
 
@@ -118,6 +146,7 @@ class AutoIssuePlugin(Star):
             yield event.plain_result("cannot determine group id")
             return
         self.repo_bindings[gid] = repo
+        _save_bindings(self.repo_bindings)
         logger.info(f"AutoIssue: bind {gid} -> {repo}")
         yield event.plain_result(f"bound group {gid} -> {repo}")
 
@@ -130,6 +159,7 @@ class AutoIssuePlugin(Star):
         gid = self._extract_group_id(event.session_id)
         if gid and gid in self.repo_bindings:
             del self.repo_bindings[gid]
+            _save_bindings(self.repo_bindings)
             yield event.plain_result(f"unbound group {gid}")
         else:
             yield event.plain_result("group not bound")
@@ -163,69 +193,58 @@ class AutoIssuePlugin(Star):
         return parts[1] if len(parts) >= 2 else session_id
 
     @staticmethod
-    def _is_reply(event) -> bool:
+    def _get_reply_comp(event):
+        """Return the Reply component if present, else None."""
+        try:
+            for comp in event.message_obj.message:
+                if type(comp).__name__ == "Reply":
+                    return comp
+        except Exception:
+            pass
+        return None
+
+    def _is_reply(self, event) -> bool:
+        if self._get_reply_comp(event):
+            return True
         try:
             raw = event.message_obj.raw_message
-            if isinstance(raw, dict):
-                return "source" in raw or "reply" in raw
+            if isinstance(raw, str):
+                return "[CQ:reply" in raw
         except Exception:
             pass
         return False
 
-    @staticmethod
-    def _extract_quoted_content(event) -> Optional[str]:
+    def _extract_quoted_content(self, event) -> Optional[str]:
         try:
-            raw = event.message_obj.raw_message
-            if not isinstance(raw, dict):
-                return None
-            text = ""
-            img_count = 0
-            for key in ("source", "reply"):
-                if key in raw and isinstance(raw[key], dict):
-                    block = raw[key]
-                    text = str(block.get("message") or block.get("content") or "")
-                    img_count += len(block.get("images", []))
-                    break
-            fwd = (
-                raw.get("forward")
-                or raw.get("multiforward")
-                or raw.get("merge_forward")
-            )
-            if isinstance(fwd, list):
+            reply = self._get_reply_comp(event)
+            if reply:
                 lines = []
-                for item in fwd:
-                    if not isinstance(item, dict):
-                        continue
-                    body = str(
-                        item.get("message")
-                        or item.get("content")
-                        or item.get("text")
-                        or ""
-                    )
-                    si = item.get("sender")
-                    sender = ""
-                    if isinstance(si, dict):
-                        sender = si.get("nickname") or si.get("username") or ""
-                    elif si:
-                        sender = str(si)
-                    sender = (
-                        sender
-                        or item.get("nickname")
-                        or item.get("username")
-                        or ""
-                    )
-                    lines.append(f"[{sender}] {body}" if sender else body)
-                    img_count += len(item.get("images", []))
-                text = "\n".join(lines)
-            elif isinstance(fwd, dict):
-                text = str(fwd.get("message", ""))
-            img_count += len(raw.get("images", []))
-            if img_count:
-                text += f"\n\n[{img_count} images]"
-            return text.strip() or None
+                for comp in reply.chain:
+                    # Json component — forwarded chat records
+                    if type(comp).__name__ == "Json":
+                        data = comp.data if isinstance(comp.data, dict) else {}
+                        news = (
+                            data.get("meta", {})
+                            .get("detail", {})
+                            .get("news", [])
+                        )
+                        for item in news:
+                            if isinstance(item, dict) and item.get("text"):
+                                lines.append(item["text"])
+                        if not lines:
+                            # fallback: use desc/prompt
+                            lines.append(data.get("desc") or data.get("prompt") or "")
+                    elif type(comp).__name__ == "Plain":
+                        t = getattr(comp, "text", "").strip()
+                        if t:
+                            lines.append(t)
+                    elif type(comp).__name__ in ("Image", "Img"):
+                        lines.append("[image]")
+                text = "\n".join(l for l in lines if l)
+                return text.strip() or None
         except Exception as e:
             logger.error(f"AutoIssue: extract error: {e}")
-            return None
+        return None
 
     async def _llm_format(self, content: str, event) -> Optional[str]:
         try:
@@ -282,7 +301,7 @@ class AutoIssuePlugin(Star):
         try:
             timeout = aiohttp.ClientTimeout(total=30)
             async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.post(url, headers=headers, json=payload) as resp:
+                async with session.post(url, headers=headers, json=payload, proxy=self.http_proxy) as resp:
                     if resp.status == 201:
                         data = await resp.json()
                         logger.info(f"AutoIssue: created {data['html_url']}")
@@ -324,7 +343,7 @@ class AutoIssuePlugin(Star):
         try:
             timeout = aiohttp.ClientTimeout(total=10)
             async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.get(url, headers=headers) as resp:
+                async with session.get(url, headers=headers, proxy=self.http_proxy) as resp:
                     if resp.status == 200:
                         data = await resp.json()
                         if not data.get("has_issues"):

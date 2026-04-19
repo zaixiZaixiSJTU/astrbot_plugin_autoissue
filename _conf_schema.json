@@ -15,11 +15,11 @@
     "type": "bool",
     "default": true
   },
-  "repo_bindings": {
-    "description": "群组与 GitHub 仓库的绑定",
-    "type": "list",
-    "default": [],
-    "hint": "每条格式: 群组ID=owner/repo，例如: 12345=username/project。也可通过 /bindrepo 命令动态绑定"
+  "http_proxy": {
+    "description": "HTTP proxy",
+    "type": "string",
+    "default": "",
+    "hint": "e.g. http://127.0.0.1:7890"
   },
   "llm_system_prompt": {
     "description": "LLM 系统提示词",
