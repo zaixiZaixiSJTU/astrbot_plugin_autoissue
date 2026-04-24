@@ -107,7 +107,7 @@ class AutoIssuePlugin(Star):
 
         yield event.plain_result("analyzing...")
 
-        content = self._extract_quoted_content(event)
+        content = await self._extract_quoted_content(event)
         if not content:
             yield event.plain_result("failed to extract quoted content")
             return
@@ -214,18 +214,19 @@ class AutoIssuePlugin(Star):
             pass
         return False
 
-    def _extract_quoted_content(self, event) -> Optional[str]:
+    async def _extract_quoted_content(self, event) -> Optional[str]:
         try:
             reply = self._get_reply_comp(event)
             if reply:
-                lines = self._extract_from_chain(reply.chain)
+                bot = getattr(event, "bot", None)
+                lines = await self._extract_from_chain(reply.chain, bot=bot)
                 text = "\n".join(l for l in lines if l)
                 return text.strip() or None
         except Exception as e:
             logger.error(f"AutoIssue: extract error: {e}")
         return None
 
-    def _extract_from_chain(self, chain, depth: int = 0) -> list:
+    async def _extract_from_chain(self, chain, bot=None, depth: int = 0) -> list:
         """递归提取消息链中的文本和图片内容，支持合并转发。"""
         lines = []
         if depth > 5:
@@ -266,28 +267,91 @@ class AutoIssuePlugin(Star):
                 else:
                     lines.append("[图片]")
             elif ctype in ("Forward", "MergedForward"):
-                # 合并转发：遍历每个消息节点
+                # 合并转发：先尝试取内嵌节点，无则通过 API 拉取
                 nodes = (
                     getattr(comp, "nodes", None)
                     or getattr(comp, "node_list", None)
                     or []
                 )
+                if not nodes:
+                    nodes = await self._fetch_forward_nodes(comp, bot)
                 for node in nodes:
                     sender = (
                         getattr(node, "sender_name", None)
                         or getattr(node, "name", None)
                         or getattr(node, "nickname", None)
+                        or (node.get("sender", {}).get("nickname") if isinstance(node, dict) else None)
                         or "unknown"
                     )
                     content = (
                         getattr(node, "content", None)
                         or getattr(node, "chain", None)
+                        or (node.get("content") if isinstance(node, dict) else None)
                         or []
                     )
-                    node_lines = self._extract_from_chain(content, depth + 1)
+                    node_lines = await self._extract_from_chain(content, bot=bot, depth=depth + 1)
                     if node_lines:
                         lines.append(f"[{sender}]: " + " | ".join(node_lines))
         return lines
+
+    async def _fetch_forward_nodes(self, comp, bot) -> list:
+        """通过 get_forward_msg API 拉取合并转发节点，返回可遍历的 node 列表。"""
+        forward_id = getattr(comp, "id", None) or getattr(comp, "forward_id", None)
+        if not forward_id or not bot:
+            return []
+        try:
+            data = await bot.call_action("get_forward_msg", message_id=forward_id)
+            messages = data.get("messages") or data.get("message") or []
+            # 将原始 dict 节点转换为统一结构，使 _extract_from_chain 能处理
+            result = []
+            for msg in messages:
+                sender = msg.get("sender", {}).get("nickname") or str(msg.get("sender", {}).get("user_id", "unknown"))
+                # content 是 OneBot 消息段列表，转成轻量 dict 节点
+                content_segs = msg.get("content", [])
+                # 若 content 是字符串（部分实现），尝试 JSON 解析
+                if isinstance(content_segs, str):
+                    try:
+                        content_segs = json.loads(content_segs)
+                    except Exception:
+                        content_segs = [{"type": "text", "data": {"text": content_segs}}]
+                # 构造轻量 dict node，用 sender 和已解析的段列表
+                parsed = self._parse_raw_segments(content_segs)
+                result.append({"sender": {"nickname": sender}, "content": parsed})
+            logger.info(f"AutoIssue: fetched {len(result)} nodes from forward {forward_id}")
+            return result
+        except Exception as e:
+            logger.error(f"AutoIssue: get_forward_msg error: {e}")
+            return []
+
+    @staticmethod
+    def _parse_raw_segments(segs: list) -> list:
+        """将 OneBot 原始消息段列表转为可被 _extract_from_chain 识别的轻量对象列表。"""
+        class _Seg:
+            def __init__(self, ctype, **kwargs):
+                self.__class__.__name__ = ctype
+                for k, v in kwargs.items():
+                    setattr(self, k, v)
+        result = []
+        for seg in (segs or []):
+            t = seg.get("type", "")
+            d = seg.get("data", {})
+            if t == "text":
+                o = _Seg.__new__(_Seg)
+                o.__class__ = type("Plain", (), {"__name__": "Plain"})
+                o.text = d.get("text", "")
+                result.append(o)
+            elif t == "image":
+                o = _Seg.__new__(_Seg)
+                o.__class__ = type("Image", (), {"__name__": "Image"})
+                o.url = d.get("url", "") or d.get("file", "")
+                result.append(o)
+            elif t == "forward":
+                o = _Seg.__new__(_Seg)
+                o.__class__ = type("Forward", (), {"__name__": "Forward"})
+                o.id = d.get("id", "")
+                o.nodes = []
+                result.append(o)
+        return result
 
     async def _llm_format(self, content: str, event) -> Optional[dict]:
         """返回 {"title": str, "body": str, "labels": list} 或 None"""
