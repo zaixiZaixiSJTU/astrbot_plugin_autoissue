@@ -1,7 +1,6 @@
 """AstrBot AutoIssue Plugin"""
 
 import json
-import os
 import re
 import asyncio
 from pathlib import Path
@@ -61,10 +60,6 @@ class AutoIssuePlugin(Star):
     async def initialize(self):
         if not self.github_token:
             logger.warning("AutoIssue: github_token not configured!")
-        if self.http_proxy:
-            os.environ["HTTP_PROXY"] = self.http_proxy
-            os.environ["HTTPS_PROXY"] = self.http_proxy
-            logger.info(f"AutoIssue: set HTTP_PROXY/HTTPS_PROXY -> {self.http_proxy}")
 
     # ---- main listener ----
 
@@ -403,14 +398,27 @@ class AutoIssuePlugin(Star):
                 "注意：聊天内容中的图片（格式为 ![图片](url)）应根据上下文嵌入到合适的章节，不要单独罗列。\n\n"
                 f"---\n聊天内容：\n{content}"
             )
-            resp = await asyncio.wait_for(
-                self.context.llm_generate(
-                    chat_provider_id=provider_id,
-                    prompt=prompt,
-                    system_prompt=self.llm_system_prompt or None,
-                ),
-                timeout=60,
-            )
+            last_exc = None
+            for attempt in range(3):
+                try:
+                    resp = await asyncio.wait_for(
+                        self.context.llm_generate(
+                            chat_provider_id=provider_id,
+                            prompt=prompt,
+                            system_prompt=self.llm_system_prompt or None,
+                        ),
+                        timeout=60,
+                    )
+                    last_exc = None
+                    break
+                except (asyncio.TimeoutError, Exception) as e:
+                    last_exc = e
+                    logger.warning(f"AutoIssue: LLM attempt {attempt + 1}/3 failed: {e}")
+                    if attempt < 2:
+                        await asyncio.sleep(3)
+            if last_exc is not None:
+                logger.error(f"AutoIssue: LLM all attempts failed: {last_exc}")
+                return None
             raw = resp.completion_text.strip()
             if len(raw) < 30:
                 logger.warning("AutoIssue: LLM output too short")
@@ -439,9 +447,6 @@ class AutoIssuePlugin(Star):
             labels = labels_map.get(issue_type, ["auto-issue"])
             title = self._extract_title(body)
             return {"title": title, "body": body, "labels": labels}
-        except asyncio.TimeoutError:
-            logger.error("AutoIssue: LLM timeout")
-            return None
         except Exception as e:
             logger.error(f"AutoIssue: LLM error: {e}")
             return None
