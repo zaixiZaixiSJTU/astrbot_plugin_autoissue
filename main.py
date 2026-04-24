@@ -112,12 +112,12 @@ class AutoIssuePlugin(Star):
             yield event.plain_result("failed to extract quoted content")
             return
 
-        issue_md = await self._llm_format(content, event)
-        if not issue_md:
+        issue_data = await self._llm_format(content, event)
+        if not issue_data:
             yield event.plain_result("LLM failed to generate issue content")
             return
 
-        result = await self._create_issue(repo, issue_md)
+        result = await self._create_issue(repo, issue_data)
         if result and result.startswith("https://"):
             yield event.plain_result(f"Issue created: {result}")
         else:
@@ -218,35 +218,79 @@ class AutoIssuePlugin(Star):
         try:
             reply = self._get_reply_comp(event)
             if reply:
-                lines = []
-                for comp in reply.chain:
-                    # Json component — forwarded chat records
-                    if type(comp).__name__ == "Json":
-                        data = comp.data if isinstance(comp.data, dict) else {}
-                        news = (
-                            data.get("meta", {})
-                            .get("detail", {})
-                            .get("news", [])
-                        )
-                        for item in news:
-                            if isinstance(item, dict) and item.get("text"):
-                                lines.append(item["text"])
-                        if not lines:
-                            # fallback: use desc/prompt
-                            lines.append(data.get("desc") or data.get("prompt") or "")
-                    elif type(comp).__name__ == "Plain":
-                        t = getattr(comp, "text", "").strip()
-                        if t:
-                            lines.append(t)
-                    elif type(comp).__name__ in ("Image", "Img"):
-                        lines.append("[image]")
+                lines = self._extract_from_chain(reply.chain)
                 text = "\n".join(l for l in lines if l)
                 return text.strip() or None
         except Exception as e:
             logger.error(f"AutoIssue: extract error: {e}")
         return None
 
-    async def _llm_format(self, content: str, event) -> Optional[str]:
+    def _extract_from_chain(self, chain, depth: int = 0) -> list:
+        """递归提取消息链中的文本和图片内容，支持合并转发。"""
+        lines = []
+        if depth > 5:
+            return lines
+        for comp in (chain or []):
+            ctype = type(comp).__name__
+            if ctype == "Json":
+                # comp.data 可能是 dict 或 JSON 字符串
+                raw = comp.data
+                if isinstance(raw, str):
+                    try:
+                        data = json.loads(raw)
+                    except Exception:
+                        data = {}
+                elif isinstance(raw, dict):
+                    data = raw
+                else:
+                    data = {}
+                news = data.get("meta", {}).get("detail", {}).get("news", [])
+                json_lines = []
+                for item in news:
+                    if isinstance(item, dict) and item.get("text"):
+                        json_lines.append(item["text"])
+                if json_lines:
+                    lines.extend(json_lines)
+                else:
+                    fallback = data.get("desc") or data.get("prompt") or ""
+                    if fallback:
+                        lines.append(fallback)
+            elif ctype == "Plain":
+                t = getattr(comp, "text", "").strip()
+                if t:
+                    lines.append(t)
+            elif ctype in ("Image", "Img"):
+                url = getattr(comp, "url", None) or getattr(comp, "file", None)
+                if url:
+                    lines.append(f"![图片]({url})")
+                else:
+                    lines.append("[图片]")
+            elif ctype in ("Forward", "MergedForward"):
+                # 合并转发：遍历每个消息节点
+                nodes = (
+                    getattr(comp, "nodes", None)
+                    or getattr(comp, "node_list", None)
+                    or []
+                )
+                for node in nodes:
+                    sender = (
+                        getattr(node, "sender_name", None)
+                        or getattr(node, "name", None)
+                        or getattr(node, "nickname", None)
+                        or "unknown"
+                    )
+                    content = (
+                        getattr(node, "content", None)
+                        or getattr(node, "chain", None)
+                        or []
+                    )
+                    node_lines = self._extract_from_chain(content, depth + 1)
+                    if node_lines:
+                        lines.append(f"[{sender}]: " + " | ".join(node_lines))
+        return lines
+
+    async def _llm_format(self, content: str, event) -> Optional[dict]:
+        """返回 {"title": str, "body": str, "labels": list} 或 None"""
         try:
             umo = event.unified_msg_origin
             provider_id = await self.context.get_current_chat_provider_id(umo=umo)
@@ -254,19 +298,40 @@ class AutoIssuePlugin(Star):
                 logger.warning("AutoIssue: no LLM provider")
                 return None
             prompt = (
-                "Analyze the following chat messages and create a GitHub Issue.\n"
-                "Requirements:\n"
-                "1. Determine if this is a BUG report, feature request, or other\n"
-                "2. For BUGs: extract description, reproduction steps, expected/actual results\n"
-                "3. For features: extract feature description, use cases\n"
-                "4. If images are mentioned, note them\n"
-                "5. Output in Chinese markdown\n\n"
-                "Output format:\n"
-                "## Title\n[concise title]\n\n"
-                "## Type\n[BUG/Feature/Other]\n\n"
-                "## Description\n[detailed description]\n\n"
-                "## Details\n[reproduction steps or use cases]\n\n"
-                f"---\nContent:\n{content}"
+                "根据以下聊天内容，创建一个 GitHub Issue，严格遵循如下规则：\n\n"
+                "第一行必须输出类型标记（仅此一行，不加任何其他内容）：\n"
+                "  - BUG 报告输出：TYPE: BUG\n"
+                "  - 功能建议输出：TYPE: FEATURE\n"
+                "  - 其他输出：TYPE: OTHER\n\n"
+                "第二行起根据类型按对应模板输出中文 Markdown 正文：\n\n"
+                "【BUG 模板】\n"
+                "## 标题\n"
+                "[Bug] <简洁标题>\n\n"
+                "## 问题描述\n"
+                "<简要描述 bug 的具体表现>\n\n"
+                "## 操作系统\n"
+                "<从聊天内容提取，未提及则填\"未知\">\n\n"
+                "## 复现步骤\n"
+                "<详细的复现步骤>\n\n"
+                "## 预期行为\n"
+                "<预期的正确行为>\n\n"
+                "## 环境信息（可选）\n"
+                "<相关配置或环境信息，无则省略此节>\n\n"
+                "## 补充信息（可选）\n"
+                "<其他信息，图片用 Markdown 图片格式嵌入，无则省略此节>\n\n"
+                "【功能建议模板】\n"
+                "## 标题\n"
+                "[Feature] <简洁标题>\n\n"
+                "## 相关问题（可选）\n"
+                "<功能建议相关的问题，无则省略此节>\n\n"
+                "## 解决方案\n"
+                "<希望实现的功能>\n\n"
+                "## 替代方案（可选）\n"
+                "<考虑过的替代方案，无则省略此节>\n\n"
+                "## 补充信息（可选）\n"
+                "<其他信息，图片用 Markdown 图片格式嵌入，无则省略此节>\n\n"
+                "注意：聊天内容中的图片（格式为 ![图片](url)）应根据上下文嵌入到合适的章节，不要单独罗列。\n\n"
+                f"---\n聊天内容：\n{content}"
             )
             resp = await asyncio.wait_for(
                 self.context.llm_generate(
@@ -276,11 +341,34 @@ class AutoIssuePlugin(Star):
                 ),
                 timeout=60,
             )
-            result = resp.completion_text.strip()
-            if len(result) < 30:
+            raw = resp.completion_text.strip()
+            if len(raw) < 30:
                 logger.warning("AutoIssue: LLM output too short")
                 return None
-            return result
+            # --- 解析类型标记 ---
+            lines = raw.splitlines()
+            issue_type = "OTHER"
+            body_start = 0
+            for i, line in enumerate(lines):
+                s = line.strip().upper()
+                if s.startswith("TYPE:"):
+                    tag = s.split(":", 1)[1].strip()
+                    if "BUG" in tag:
+                        issue_type = "BUG"
+                    elif "FEATURE" in tag:
+                        issue_type = "FEATURE"
+                    body_start = i + 1
+                    break
+            body = "\n".join(lines[body_start:]).strip()
+            # --- 标签映射 ---
+            labels_map = {
+                "BUG": ["📝 BUG Report"],
+                "FEATURE": ["💡 Feature Request"],
+                "OTHER": ["auto-issue"],
+            }
+            labels = labels_map.get(issue_type, ["auto-issue"])
+            title = self._extract_title(body)
+            return {"title": title, "body": body, "labels": labels}
         except asyncio.TimeoutError:
             logger.error("AutoIssue: LLM timeout")
             return None
@@ -288,16 +376,18 @@ class AutoIssuePlugin(Star):
             logger.error(f"AutoIssue: LLM error: {e}")
             return None
 
-    async def _create_issue(self, repo: str, body: str) -> Optional[str]:
+    async def _create_issue(self, repo: str, issue_data: dict) -> Optional[str]:
         owner, repo_name = repo.split("/", 1)
-        title = self._extract_title(body)
+        title = issue_data.get("title", "Auto-generated Issue from chat")
+        body = issue_data.get("body", "")
+        labels = issue_data.get("labels", ["auto-issue"])
         url = f"https://api.github.com/repos/{owner}/{repo_name}/issues"
         headers = {
             "Authorization": f"token {self.github_token}",
             "Accept": "application/vnd.github.v3+json",
             "User-Agent": "AstrBot-AutoIssue",
         }
-        payload = {"title": title[:256], "body": body, "labels": ["auto-issue"]}
+        payload = {"title": title[:256], "body": body, "labels": labels}
         try:
             timeout = aiohttp.ClientTimeout(total=30)
             async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -323,13 +413,13 @@ class AutoIssuePlugin(Star):
         found_header = False
         for line in md.split("\n"):
             s = line.strip()
-            if s.startswith("#") and ("Title" in s or "title" in s):
+            # 匹配 ## 标题 / ## Title 节
+            if s.startswith("#") and ("标题" in s or "Title" in s or "title" in s):
                 found_header = True
                 continue
             if found_header and s and not s.startswith("#"):
-                cleaned = re.sub(r"\[.*?\]", "", s).strip()
-                if len(cleaned) >= 3:
-                    return cleaned
+                # 保留 [Bug] / [Feature] 前缀，直接使用该行
+                return s
         return "Auto-generated Issue from chat"
 
     async def _verify_repo(self, repo: str) -> tuple:
