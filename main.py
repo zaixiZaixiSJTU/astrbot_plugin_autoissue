@@ -357,11 +357,12 @@ class AutoIssuePlugin(Star):
     async def _llm_format(self, content: str, event) -> Optional[dict]:
         """返回 {"title": str, "body": str, "labels": list} 或 None"""
         try:
-            umo = event.unified_msg_origin
-            provider_id = await self.context.get_current_chat_provider_id(umo=umo)
-            if not provider_id:
-                logger.warning("AutoIssue: no LLM provider")
+            # 使用全局默认 LLM provider，不依赖会话级别配置
+            prov = self.context.get_using_provider()
+            if not prov:
+                logger.warning("AutoIssue: no LLM provider configured")
                 return None
+            provider_id = prov.meta().id
             prompt = (
                 "根据以下聊天内容，创建一个 GitHub Issue，严格遵循如下规则：\n\n"
                 "第一行必须输出类型标记（仅此一行，不加任何其他内容）：\n"
