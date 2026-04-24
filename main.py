@@ -107,12 +107,12 @@ class AutoIssuePlugin(Star):
 
         yield event.plain_result("analyzing...")
 
-        content = await self._extract_quoted_content(event)
-        if not content:
+        content, image_urls = await self._extract_quoted_content(event)
+        if not content and not image_urls:
             yield event.plain_result("failed to extract quoted content")
             return
 
-        issue_data = await self._llm_format(content, event)
+        issue_data = await self._llm_format(content, image_urls, event)
         if not issue_data:
             yield event.plain_result("LLM failed to generate issue content")
             return
@@ -214,23 +214,25 @@ class AutoIssuePlugin(Star):
             pass
         return False
 
-    async def _extract_quoted_content(self, event) -> Optional[str]:
+    async def _extract_quoted_content(self, event) -> tuple[str, list[str]]:
+        """返回 (文本内容, 图片URL列表)"""
         try:
             reply = self._get_reply_comp(event)
             if reply:
                 bot = getattr(event, "bot", None)
-                lines = await self._extract_from_chain(reply.chain, bot=bot)
-                text = "\n".join(l for l in lines if l)
-                return text.strip() or None
+                text_lines, image_urls = await self._extract_from_chain(reply.chain, bot=bot)
+                text = "\n".join(l for l in text_lines if l).strip()
+                return text, image_urls
         except Exception as e:
             logger.error(f"AutoIssue: extract error: {e}")
-        return None
+        return "", []
 
-    async def _extract_from_chain(self, chain, bot=None, depth: int = 0) -> list:
-        """递归提取消息链中的文本和图片内容，支持合并转发。"""
+    async def _extract_from_chain(self, chain, bot=None, depth: int = 0) -> tuple[list, list]:
+        """递归提取消息链中的文本行和图片URL，支持合并转发。返回 (text_lines, image_urls)"""
         lines = []
+        image_urls = []
         if depth > 5:
-            return lines
+            return lines, image_urls
         for comp in (chain or []):
             ctype = type(comp).__name__
             if ctype == "Json":
@@ -262,8 +264,9 @@ class AutoIssuePlugin(Star):
                     lines.append(t)
             elif ctype in ("Image", "Img"):
                 url = getattr(comp, "url", None) or getattr(comp, "file", None)
-                if url:
-                    lines.append(f"![图片]({url})")
+                if url and isinstance(url, str) and url.startswith("http"):
+                    image_urls.append(url)
+                    lines.append(f"[图片{len(image_urls)}]")
                 else:
                     lines.append("[图片]")
             elif ctype in ("Forward", "MergedForward"):
@@ -289,10 +292,11 @@ class AutoIssuePlugin(Star):
                         or (node.get("content") if isinstance(node, dict) else None)
                         or []
                     )
-                    node_lines = await self._extract_from_chain(content, bot=bot, depth=depth + 1)
+                    node_lines, node_imgs = await self._extract_from_chain(content, bot=bot, depth=depth + 1)
+                    image_urls.extend(node_imgs)
                     if node_lines:
                         lines.append(f"[{sender}]: " + " | ".join(node_lines))
-        return lines
+        return lines, image_urls
 
     async def _fetch_forward_nodes(self, comp, bot) -> list:
         """通过 get_forward_msg API 拉取合并转发节点，返回可遍历的 node 列表。"""
@@ -354,7 +358,7 @@ class AutoIssuePlugin(Star):
                 result.append(o)
         return result
 
-    async def _llm_format(self, content: str, event) -> Optional[dict]:
+    async def _llm_format(self, content: str, image_urls: list, event) -> Optional[dict]:
         """返回 {"title": str, "body": str, "labels": list} 或 None"""
         try:
             # 使用全局默认 LLM provider，不依赖会话级别配置
@@ -396,9 +400,10 @@ class AutoIssuePlugin(Star):
                 "<考虑过的替代方案，无则省略此节>\n\n"
                 "## 补充信息（可选）\n"
                 "<其他信息，图片用 Markdown 图片格式嵌入，无则省略此节>\n\n"
-                "注意：聊天内容中的图片（格式为 ![图片](url)）应根据上下文嵌入到合适的章节，不要单独罗列。\n\n"
-                f"---\n聊天内容：\n{content}"
+                "注意：聊天内容中标记为[图片N]的图片已作为附件提供，请根据上下文将其嵌入到合适的章节。\n\n"
+                f"---\n聊天内容：\n{content if content else '（无文字内容，请根据图片内容分析）'}"
             )
+            logger.info(f"AutoIssue: calling LLM with {len(image_urls)} image(s), content_len={len(content)}")
             last_exc = None
             for attempt in range(3):
                 try:
@@ -406,6 +411,7 @@ class AutoIssuePlugin(Star):
                         self.context.llm_generate(
                             chat_provider_id=provider_id,
                             prompt=prompt,
+                            image_urls=image_urls if image_urls else None,
                             system_prompt=self.llm_system_prompt or None,
                         ),
                         timeout=60,
@@ -421,8 +427,9 @@ class AutoIssuePlugin(Star):
                 logger.error(f"AutoIssue: LLM all attempts failed: {last_exc}")
                 return None
             raw = resp.completion_text.strip()
+            logger.info(f"AutoIssue: LLM raw output length={len(raw)}")
             if len(raw) < 30:
-                logger.warning("AutoIssue: LLM output too short")
+                logger.warning(f"AutoIssue: LLM output too short: {repr(raw)}")
                 return None
             # --- 解析类型标记 ---
             lines = raw.splitlines()
