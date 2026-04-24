@@ -1,6 +1,7 @@
 """AstrBot AutoIssue Plugin"""
 
 import json
+import os
 import re
 import asyncio
 from pathlib import Path
@@ -60,6 +61,10 @@ class AutoIssuePlugin(Star):
     async def initialize(self):
         if not self.github_token:
             logger.warning("AutoIssue: github_token not configured!")
+        if self.http_proxy:
+            os.environ["HTTP_PROXY"] = self.http_proxy
+            os.environ["HTTPS_PROXY"] = self.http_proxy
+            logger.info(f"AutoIssue: set HTTP_PROXY/HTTPS_PROXY -> {self.http_proxy}")
 
     # ---- main listener ----
 
