@@ -306,8 +306,8 @@ class AutoIssuePlugin(Star):
             result = []
             for msg in messages:
                 sender = msg.get("sender", {}).get("nickname") or str(msg.get("sender", {}).get("user_id", "unknown"))
-                # content 是 OneBot 消息段列表，转成轻量 dict 节点
-                content_segs = msg.get("content", [])
+                # NapCat/LLOneBot 返回的字段是 "message"，部分实现用 "content"
+                content_segs = msg.get("message") or msg.get("content") or []
                 # 若 content 是字符串（部分实现），尝试 JSON 解析
                 if isinstance(content_segs, str):
                     try:
@@ -318,6 +318,7 @@ class AutoIssuePlugin(Star):
                 parsed = self._parse_raw_segments(content_segs)
                 result.append({"sender": {"nickname": sender}, "content": parsed})
             logger.info(f"AutoIssue: fetched {len(result)} nodes from forward {forward_id}")
+            logger.debug(f"AutoIssue: forward raw keys sample: {list(messages[0].keys()) if messages else []}")
             return result
         except Exception as e:
             logger.error(f"AutoIssue: get_forward_msg error: {e}")
