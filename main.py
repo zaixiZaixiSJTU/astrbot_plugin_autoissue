@@ -473,7 +473,7 @@ class AutoIssuePlugin(Star):
         labels = issue_data.get("labels", ["auto-issue"])
         url = f"https://api.github.com/repos/{owner}/{repo_name}/issues"
         headers = {
-            "Authorization": f"token {self.github_token}",
+            "Authorization": f"Bearer {self.github_token}",
             "Accept": "application/vnd.github.v3+json",
             "User-Agent": "AstrBot-AutoIssue",
         }
@@ -489,10 +489,10 @@ class AutoIssuePlugin(Star):
                     text = await resp.text()
                     logger.error(f"AutoIssue: GitHub {resp.status}: {text}")
                     return {
-                        401: "Token invalid",
-                        403: "Forbidden",
+                        401: "Token invalid or expired",
+                        403: "Permission denied (403): Token 缺少权限。细粒度 PAT 请在 GitHub 中为该仓库授予 Issues: Read & write 权限；经典 PAT 请确保勾选 repo 或 public_repo scope",
                         404: f"Repo {repo} not found",
-                        422: "Validation failed",
+                        422: "Validation failed (label 不存在或字段不合法)",
                     }.get(resp.status, f"HTTP {resp.status}")
         except aiohttp.ClientError as e:
             logger.error(f"AutoIssue: net error: {e}")
@@ -516,7 +516,7 @@ class AutoIssuePlugin(Star):
         owner, name = repo.split("/", 1)
         url = f"https://api.github.com/repos/{owner}/{name}"
         headers = {
-            "Authorization": f"token {self.github_token}",
+            "Authorization": f"Bearer {self.github_token}",
             "Accept": "application/vnd.github.v3+json",
             "User-Agent": "AstrBot-AutoIssue",
         }
