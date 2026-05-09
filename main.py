@@ -400,8 +400,15 @@ class AutoIssuePlugin(Star):
                 "<考虑过的替代方案，无则省略此节>\n\n"
                 "## 补充信息（可选）\n"
                 "<其他信息，图片用 Markdown 图片格式嵌入，无则省略此节>\n\n"
-                "注意：聊天内容中标记为[图片N]的图片已作为附件提供，请根据上下文将其嵌入到合适的章节。\n\n"
-                f"---\n聊天内容：\n{content if content else '（无文字内容，请根据图片内容分析）'}"
+                "注意：聊天内容中标记为[图片N]的图片已作为附件提供，请根据上下文将其嵌入到合适的章节，"
+                "必须使用下方列出的真实URL，格式为 ![描述](URL)。\n\n"
+                + (
+                    "图片URL对应关系（直接使用这些URL，不要自行编造链接）：\n"
+                    + "\n".join(f"[图片{i}] → {url}" for i, url in enumerate(image_urls, 1))
+                    + "\n\n"
+                    if image_urls else ""
+                )
+                + f"---\n聊天内容：\n{content if content else '（无文字内容，请根据图片内容分析）'}"
             )
             logger.info(f"AutoIssue: calling LLM with {len(image_urls)} image(s), content_len={len(content)}")
             last_exc = None

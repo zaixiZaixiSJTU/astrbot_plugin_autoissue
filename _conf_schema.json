@@ -6,7 +6,7 @@
     "hint": "需要 repo 权限的 token，在 GitHub Settings → Developer settings → Personal access tokens 生成"
   },
   "trigger_keyword": {
-    "description": "触发创建 issue 的关键字",
+    "description": "触发创建  的关键字",
     "type": "string",
     "default": "issue"
   },
