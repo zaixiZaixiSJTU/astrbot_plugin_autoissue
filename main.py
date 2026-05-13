@@ -470,6 +470,8 @@ class AutoIssuePlugin(Star):
         owner, repo_name = repo.split("/", 1)
         title = issue_data.get("title", "Auto-generated Issue from chat")
         body = issue_data.get("body", "")
+        note = ">[!NOTE]\n>\n> 此 issue 由 AI 基于 QQ 群聊天记录总结生成\n\n"
+        body = note + body
         labels = issue_data.get("labels", ["auto-issue"])
         url = f"https://api.github.com/repos/{owner}/{repo_name}/issues"
         headers = {
