@@ -2,5 +2,5 @@ name: astrbot_plugin_autoissue
 display_name: 自动Issue插件
 author: zaixiZaixiSJTU
 version: 1.0.0
-description: 回复合并转发消息并@机器人输入issue，自动提取信息创建GitHub Issue
+description: 回复合并转发消息并 @机器人 输入 issue，自动利用 LLM 提取内容并在 GitHub 仓库创建 Issue。
 repo: https://github.com/zaixiZaixiSJTU/astrbot_plugin_autoissue
