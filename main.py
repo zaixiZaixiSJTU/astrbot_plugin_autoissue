@@ -1,7 +1,6 @@
 """AstrBot AutoIssue Plugin"""
 
 import json
-import re
 import asyncio
 from pathlib import Path
 from typing import Optional
@@ -10,24 +9,21 @@ import aiohttp
 
 from astrbot.api import logger
 from astrbot.api.event import filter
-from astrbot.api.star import Context, Star, register
+from astrbot.api.star import Context, Star, StarTools, register
 from astrbot.api.message_components import At
 
-_BINDINGS_FILE = Path(__file__).parent / "repo_bindings.json"
-
-
-def _load_bindings() -> dict:
+def _load_bindings(file_path: Path) -> dict:
     try:
-        if _BINDINGS_FILE.exists():
-            return json.loads(_BINDINGS_FILE.read_text(encoding="utf-8"))
+        if file_path.exists():
+            return json.loads(file_path.read_text(encoding="utf-8"))
     except Exception as e:
         logger.warning(f"AutoIssue: failed to load bindings: {e}")
     return {}
 
 
-def _save_bindings(bindings: dict) -> None:
+def _save_bindings(file_path: Path, bindings: dict) -> None:
     try:
-        _BINDINGS_FILE.write_text(
+        file_path.write_text(
             json.dumps(bindings, ensure_ascii=False, indent=2), encoding="utf-8"
         )
     except Exception as e:
@@ -50,7 +46,9 @@ class AutoIssuePlugin(Star):
         self.llm_system_prompt: str = config.get("llm_system_prompt", "")
         self.http_proxy: str = config.get("http_proxy", "") or None
 
-        self.repo_bindings: dict = _load_bindings()
+        self._bindings_file: Path = StarTools.get_data_dir() / "repo_bindings.json"
+        self._bindings_lock = asyncio.Lock()
+        self.repo_bindings: dict = _load_bindings(self._bindings_file)
 
         logger.info(
             f"AutoIssue: init ok | token={'yes' if self.github_token else 'NO'} | "
@@ -145,8 +143,9 @@ class AutoIssuePlugin(Star):
         if not gid:
             yield event.plain_result("cannot determine group id")
             return
-        self.repo_bindings[gid] = repo
-        _save_bindings(self.repo_bindings)
+        async with self._bindings_lock:
+            self.repo_bindings[gid] = repo
+            _save_bindings(self._bindings_file, self.repo_bindings)
         logger.info(f"AutoIssue: bind {gid} -> {repo}")
         yield event.plain_result(f"bound group {gid} -> {repo}")
 
@@ -158,8 +157,9 @@ class AutoIssuePlugin(Star):
             return
         gid = self._extract_group_id(event.session_id)
         if gid and gid in self.repo_bindings:
-            del self.repo_bindings[gid]
-            _save_bindings(self.repo_bindings)
+            async with self._bindings_lock:
+                del self.repo_bindings[gid]
+                _save_bindings(self._bindings_file, self.repo_bindings)
             yield event.plain_result(f"unbound group {gid}")
         else:
             yield event.plain_result("group not bound")
@@ -331,31 +331,19 @@ class AutoIssuePlugin(Star):
     @staticmethod
     def _parse_raw_segments(segs: list) -> list:
         """将 OneBot 原始消息段列表转为可被 _extract_from_chain 识别的轻量对象列表。"""
-        class _Seg:
-            def __init__(self, ctype, **kwargs):
-                self.__class__.__name__ = ctype
-                for k, v in kwargs.items():
-                    setattr(self, k, v)
         result = []
         for seg in (segs or []):
             t = seg.get("type", "")
             d = seg.get("data", {})
             if t == "text":
-                o = _Seg.__new__(_Seg)
-                o.__class__ = type("Plain", (), {"__name__": "Plain"})
-                o.text = d.get("text", "")
-                result.append(o)
+                obj = type("Plain", (), {"text": d.get("text", "")})()
+                result.append(obj)
             elif t == "image":
-                o = _Seg.__new__(_Seg)
-                o.__class__ = type("Image", (), {"__name__": "Image"})
-                o.url = d.get("url", "") or d.get("file", "")
-                result.append(o)
+                obj = type("Image", (), {"url": d.get("url", "") or d.get("file", "")})()
+                result.append(obj)
             elif t == "forward":
-                o = _Seg.__new__(_Seg)
-                o.__class__ = type("Forward", (), {"__name__": "Forward"})
-                o.id = d.get("id", "")
-                o.nodes = []
-                result.append(o)
+                obj = type("Forward", (), {"id": d.get("id", ""), "nodes": []})()
+                result.append(obj)
         return result
 
     async def _llm_format(self, content: str, image_urls: list, event) -> Optional[dict]:
