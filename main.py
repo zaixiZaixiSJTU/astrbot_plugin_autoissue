@@ -15,6 +15,11 @@ from typing import Optional
 
 import aiohttp
 
+# 压制 openai/httpx/httpcore 的 DEBUG 日志（base64 帧数据太长）
+import logging as _logging
+for _noisy in ("openai._base_client", "httpcore", "httpx"):
+    _logging.getLogger(_noisy).setLevel(_logging.WARNING)
+
 from astrbot.api import logger
 from astrbot.api.event import filter
 from astrbot.api.star import Context, Star, StarTools, register
