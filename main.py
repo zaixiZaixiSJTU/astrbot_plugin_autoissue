@@ -2,6 +2,10 @@
 
 import json
 import asyncio
+import base64
+import uuid
+import tempfile
+import os
 from pathlib import Path
 from typing import Optional
 
@@ -105,12 +109,12 @@ class AutoIssuePlugin(Star):
 
         yield event.plain_result("analyzing...")
 
-        content, image_urls = await self._extract_quoted_content(event)
-        if not content and not image_urls:
+        content, media_urls = await self._extract_quoted_content(event)
+        if not content and not media_urls:
             yield event.plain_result("failed to extract quoted content")
             return
 
-        issue_data = await self._llm_format(content, image_urls, event)
+        issue_data = await self._llm_format(content, media_urls, event)
         if not issue_data:
             yield event.plain_result("LLM failed to generate issue content")
             return
@@ -214,25 +218,25 @@ class AutoIssuePlugin(Star):
             pass
         return False
 
-    async def _extract_quoted_content(self, event) -> tuple[str, list[str]]:
-        """返回 (文本内容, 图片URL列表)"""
+    async def _extract_quoted_content(self, event) -> tuple[str, list]:
+        """返回 (文本内容, media_urls)，media_urls 为 [(kind, url), ...] 列表。"""
         try:
             reply = self._get_reply_comp(event)
             if reply:
                 bot = getattr(event, "bot", None)
-                text_lines, image_urls = await self._extract_from_chain(reply.chain, bot=bot)
+                text_lines, media_urls = await self._extract_from_chain(reply.chain, bot=bot)
                 text = "\n".join(l for l in text_lines if l).strip()
-                return text, image_urls
+                return text, media_urls
         except Exception as e:
             logger.error(f"AutoIssue: extract error: {e}")
         return "", []
 
     async def _extract_from_chain(self, chain, bot=None, depth: int = 0) -> tuple[list, list]:
-        """递归提取消息链中的文本行和图片URL，支持合并转发。返回 (text_lines, image_urls)"""
+        """递归提取消息链中的文本行和媒体URL，支持合并转发。返回 (text_lines, media_urls)，media_urls 为 [(kind, url), ...] 列表。"""
         lines = []
-        image_urls = []
+        media_urls = []
         if depth > 5:
-            return lines, image_urls
+            return lines, media_urls
         for comp in (chain or []):
             ctype = type(comp).__name__
             if ctype == "Json":
@@ -265,12 +269,17 @@ class AutoIssuePlugin(Star):
             elif ctype in ("Image", "Img"):
                 url = getattr(comp, "url", None) or getattr(comp, "file", None)
                 if url and isinstance(url, str) and url.startswith("http"):
-                    image_urls.append(url)
-                    lines.append(f"[图片{len(image_urls)}]")
+                    media_urls.append(("图片", url))
+                    lines.append(f"[图片{len(media_urls)}]")
                 else:
                     lines.append("[图片]")
             elif ctype == "Video":
-                lines.append("[视频]")
+                url = getattr(comp, "url", None) or getattr(comp, "file", None)
+                if url and isinstance(url, str) and url.startswith("http"):
+                    media_urls.append(("视频", url))
+                    lines.append(f"[视频{len(media_urls)}]")
+                else:
+                    lines.append("[视频]")
             elif ctype in ("Forward", "MergedForward"):
                 # 合并转发：先尝试取内嵌节点，无则通过 API 拉取
                 nodes = (
@@ -294,11 +303,11 @@ class AutoIssuePlugin(Star):
                         or (node.get("content") if isinstance(node, dict) else None)
                         or []
                     )
-                    node_lines, node_imgs = await self._extract_from_chain(content, bot=bot, depth=depth + 1)
-                    image_urls.extend(node_imgs)
+                    node_lines, node_media = await self._extract_from_chain(content, bot=bot, depth=depth + 1)
+                    media_urls.extend(node_media)
                     if node_lines:
                         lines.append(f"[{sender}]: " + " | ".join(node_lines))
-        return lines, image_urls
+        return lines, media_urls
 
     async def _fetch_forward_nodes(self, comp, bot) -> list:
         """通过 get_forward_msg API 拉取合并转发节点，返回可遍历的 node 列表。"""
@@ -351,8 +360,9 @@ class AutoIssuePlugin(Star):
                 result.append(obj)
         return result
 
-    async def _llm_format(self, content: str, image_urls: list, event) -> Optional[dict]:
-        """返回 {"title": str, "body": str, "labels": list} 或 None"""
+    async def _llm_format(self, content: str, media_urls: list, event) -> Optional[dict]:
+        """返回 {"title": str, "body": str, "labels": list} 或 None。
+        media_urls 为 [(kind, url), ...] 列表，kind 取 \"图片\" 或 \"视频\"。"""
         try:
             # 使用全局默认 LLM provider，不依赖会话级别配置
             prov = self.context.get_using_provider()
@@ -360,6 +370,8 @@ class AutoIssuePlugin(Star):
                 logger.warning("AutoIssue: no LLM provider configured")
                 return None
             provider_id = prov.meta().id
+            # 提取所有 URL 传给 LLM（多模态模型可同时处理图片和视频）
+            all_urls = [url for _, url in media_urls]
             prompt = (
                 "根据以下聊天内容，创建一个 GitHub Issue，严格遵循如下规则：\n\n"
                 "第一行必须输出类型标记（仅此一行，不加任何其他内容）：\n"
@@ -381,7 +393,7 @@ class AutoIssuePlugin(Star):
                 "## 环境信息（可选）\n"
                 "<相关配置或环境信息，无则省略此节>\n\n"
                 "## 补充信息（可选）\n"
-                "<其他信息，图片用 Markdown 图片格式嵌入，无则省略此节>\n\n"
+                "<其他信息，图片用 Markdown 图片格式嵌入，视频可按需描述关键帧/场景，无则省略此节>\n\n"
                 "【功能建议模板】\n"
                 "## 标题\n"
                 "[Feature] <简洁标题>\n\n"
@@ -392,18 +404,18 @@ class AutoIssuePlugin(Star):
                 "## 替代方案（可选）\n"
                 "<考虑过的替代方案，无则省略此节>\n\n"
                 "## 补充信息（可选）\n"
-                "<其他信息，图片用 Markdown 图片格式嵌入，无则省略此节>\n\n"
-                "注意：聊天内容中标记为[图片N]的图片已作为附件提供，请根据上下文将其嵌入到合适的章节，"
+                "<其他信息，图片用 Markdown 图片格式嵌入，视频可按需描述关键帧/场景，无则省略此节>\n\n"
+                "注意：聊天内容中标记为[图片N]或[视频N]的媒体已作为附件提供，请根据上下文将它们嵌入到合适的章节，"
                 "必须使用下方列出的真实URL，格式为 ![描述](URL)。\n\n"
                 + (
-                    "图片URL对应关系（直接使用这些URL，不要自行编造链接）：\n"
-                    + "\n".join(f"[图片{i}] → {url}" for i, url in enumerate(image_urls, 1))
+                    "媒体URL对应关系（直接使用这些URL，不要自行编造链接）：\n"
+                    + "\n".join(f"[{kind}{i}] → {url}" for i, (kind, url) in enumerate(media_urls, 1))
                     + "\n\n"
-                    if image_urls else ""
+                    if media_urls else ""
                 )
-                + f"---\n聊天内容：\n{content if content else '（无文字内容，请根据图片内容分析）'}"
+                + f"---\n聊天内容：\n{content if content else '（无文字内容，请根据媒体内容分析）'}"
             )
-            logger.info(f"AutoIssue: calling LLM with {len(image_urls)} image(s), content_len={len(content)}")
+            logger.info(f"AutoIssue: calling LLM with {len(media_urls)} media(s), content_len={len(content)}")
             last_exc = None
             for attempt in range(3):
                 try:
@@ -411,7 +423,7 @@ class AutoIssuePlugin(Star):
                         self.context.llm_generate(
                             chat_provider_id=provider_id,
                             prompt=prompt,
-                            image_urls=image_urls if image_urls else None,
+                            image_urls=all_urls if all_urls else None,
                             system_prompt=self.llm_system_prompt or None,
                         ),
                         timeout=60,
@@ -454,15 +466,79 @@ class AutoIssuePlugin(Star):
             }
             labels = labels_map.get(issue_type, ["auto-issue"])
             title = self._extract_title(body)
-            return {"title": title, "body": body, "labels": labels}
+            return {"title": title, "body": body, "labels": labels, "media_urls": media_urls}
         except Exception as e:
             logger.error(f"AutoIssue: LLM error: {e}")
             return None
+
+    async def _upload_video_to_repo(self, repo: str, video_url: str) -> Optional[str]:
+        """下载视频并上传到仓库 .issue-assets/，返回 raw.githubusercontent.com URL。"""
+        owner, repo_name = repo.split("/", 1)
+
+        # 1) 下载视频到临时文件
+        tmp_path = None
+        try:
+            suffix = ".mp4"
+            tmp_fd, tmp_path = tempfile.mkstemp(suffix=suffix)
+            os.close(tmp_fd)
+            timeout = aiohttp.ClientTimeout(total=120)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(video_url) as resp:
+                    if resp.status != 200:
+                        logger.warning(f"AutoIssue: download video failed HTTP {resp.status}: {video_url[:80]}")
+                        return None
+                    with open(tmp_path, "wb") as f:
+                        f.write(await resp.read())
+            logger.info(f"AutoIssue: downloaded video -> {tmp_path}")
+
+            # 2) 上传到 GitHub
+            with open(tmp_path, "rb") as f:
+                content_b64 = base64.b64encode(f.read()).decode("ascii")
+
+            filename = f"{uuid.uuid4()}{suffix}"
+            upload_url = f"https://api.github.com/repos/{owner}/{repo_name}/contents/.issue-assets/{filename}"
+            headers = {
+                "Authorization": f"Bearer {self.github_token}",
+                "Accept": "application/vnd.github.v3+json",
+                "User-Agent": "AstrBot-AutoIssue",
+            }
+            payload = {
+                "message": f"upload video attachment",
+                "content": content_b64,
+            }
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
+                async with session.put(upload_url, headers=headers, json=payload, proxy=self.http_proxy) as resp:
+                    if resp.status in (200, 201):
+                        raw_url = f"https://raw.githubusercontent.com/{owner}/{repo_name}/main/.issue-assets/{filename}"
+                        logger.info(f"AutoIssue: uploaded video -> {raw_url}")
+                        return raw_url
+                    text = await resp.text()
+                    logger.error(f"AutoIssue: upload video failed HTTP {resp.status}: {text}")
+                    return None
+        except Exception as e:
+            logger.error(f"AutoIssue: upload video error: {e}")
+            return None
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                os.remove(tmp_path)
+                logger.info(f"AutoIssue: cleaned up temp file {tmp_path}")
 
     async def _create_issue(self, repo: str, issue_data: dict) -> Optional[str]:
         owner, repo_name = repo.split("/", 1)
         title = issue_data.get("title", "Auto-generated Issue from chat")
         body = issue_data.get("body", "")
+        media_urls: list = issue_data.get("media_urls", [])
+
+        # 替换视频 URL：下载 → 上传到 GitHub → 用 raw URL 替换
+        for kind, url in media_urls:
+            if kind == "视频":
+                new_url = await self._upload_video_to_repo(repo, url)
+                if new_url:
+                    body = body.replace(url, new_url)
+                    logger.info(f"AutoIssue: replaced video URL in body: {url[:60]}... -> {new_url}")
+                else:
+                    logger.warning(f"AutoIssue: failed to upload video, keeping original URL")
+
         note = ">[!NOTE]\n>\n> 此 issue 由 AI 基于 QQ 群聊天记录总结生成\n\n"
         body = note + body
         labels = issue_data.get("labels", ["auto-issue"])
