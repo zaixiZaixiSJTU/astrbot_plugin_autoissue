@@ -269,6 +269,8 @@ class AutoIssuePlugin(Star):
                     lines.append(f"[图片{len(image_urls)}]")
                 else:
                     lines.append("[图片]")
+            elif ctype == "Video":
+                lines.append("[视频]")
             elif ctype in ("Forward", "MergedForward"):
                 # 合并转发：先尝试取内嵌节点，无则通过 API 拉取
                 nodes = (
@@ -340,6 +342,9 @@ class AutoIssuePlugin(Star):
                 result.append(obj)
             elif t == "image":
                 obj = type("Image", (), {"url": d.get("url", "") or d.get("file", "")})()
+                result.append(obj)
+            elif t == "video":
+                obj = type("Video", (), {"url": d.get("url", "") or d.get("file", "")})()
                 result.append(obj)
             elif t == "forward":
                 obj = type("Forward", (), {"id": d.get("id", ""), "nodes": []})()
