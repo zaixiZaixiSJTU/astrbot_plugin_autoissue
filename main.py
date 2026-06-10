@@ -1,11 +1,15 @@
 """AstrBot AutoIssue Plugin"""
 
 import json
+import re
 import asyncio
 import base64
+import subprocess
 import uuid
 import tempfile
 import os
+import shutil
+import glob
 from pathlib import Path
 from typing import Optional
 
@@ -109,7 +113,7 @@ class AutoIssuePlugin(Star):
 
         yield event.plain_result("analyzing...")
 
-        content, media_urls = await self._extract_quoted_content(event)
+        content, media_urls = await self._extract_quoted_content(event, group_id)
         if not content and not media_urls:
             yield event.plain_result("failed to extract quoted content")
             return
@@ -218,20 +222,20 @@ class AutoIssuePlugin(Star):
             pass
         return False
 
-    async def _extract_quoted_content(self, event) -> tuple[str, list]:
+    async def _extract_quoted_content(self, event, group_id: str = "") -> tuple[str, list]:
         """返回 (文本内容, media_urls)，media_urls 为 [(kind, url), ...] 列表。"""
         try:
             reply = self._get_reply_comp(event)
             if reply:
                 bot = getattr(event, "bot", None)
-                text_lines, media_urls = await self._extract_from_chain(reply.chain, bot=bot)
+                text_lines, media_urls = await self._extract_from_chain(reply.chain, bot=bot, group_id=group_id)
                 text = "\n".join(l for l in text_lines if l).strip()
                 return text, media_urls
         except Exception as e:
             logger.error(f"AutoIssue: extract error: {e}")
         return "", []
 
-    async def _extract_from_chain(self, chain, bot=None, depth: int = 0) -> tuple[list, list]:
+    async def _extract_from_chain(self, chain, bot=None, depth: int = 0, group_id: str = "") -> tuple[list, list]:
         """递归提取消息链中的文本行和媒体URL，支持合并转发。返回 (text_lines, media_urls)，media_urls 为 [(kind, url), ...] 列表。"""
         lines = []
         media_urls = []
@@ -280,6 +284,29 @@ class AutoIssuePlugin(Star):
                     lines.append(f"[视频{len(media_urls)}]")
                 else:
                     lines.append("[视频]")
+            elif ctype == "File":
+                url = getattr(comp, "url", None)
+                file_id = getattr(comp, "file_id", None)
+                name = getattr(comp, "name", "") or url or "文件"
+                resolved_url = None
+                if url and url.startswith("http"):
+                    resolved_url = url
+                elif file_id and bot and group_id:
+                    try:
+                        file_info = await bot.call_action("get_group_file_url", group_id=group_id, file_id=file_id)
+                        if isinstance(file_info, dict):
+                            resolved_url = file_info.get("url") or file_info.get("file") or ""
+                        elif isinstance(file_info, str):
+                            resolved_url = file_info
+                        if not (resolved_url and isinstance(resolved_url, str) and resolved_url.startswith("http")):
+                            resolved_url = None
+                    except Exception as e:
+                        logger.warning(f"AutoIssue: get_group_file_url failed for {file_id}: {e}")
+                if resolved_url:
+                    media_urls.append(("视频", resolved_url))
+                    lines.append(f"[视频{len(media_urls)}]")
+                else:
+                    lines.append(f"[文件: {name}]")
             elif ctype in ("Forward", "MergedForward"):
                 # 合并转发：先尝试取内嵌节点，无则通过 API 拉取
                 nodes = (
@@ -303,7 +330,7 @@ class AutoIssuePlugin(Star):
                         or (node.get("content") if isinstance(node, dict) else None)
                         or []
                     )
-                    node_lines, node_media = await self._extract_from_chain(content, bot=bot, depth=depth + 1)
+                    node_lines, node_media = await self._extract_from_chain(content, bot=bot, depth=depth + 1, group_id=group_id)
                     media_urls.extend(node_media)
                     if node_lines:
                         lines.append(f"[{sender}]: " + " | ".join(node_lines))
@@ -355,10 +382,63 @@ class AutoIssuePlugin(Star):
             elif t == "video":
                 obj = type("Video", (), {"url": d.get("url", "") or d.get("file", "")})()
                 result.append(obj)
+            elif t == "file":
+                obj = type("File", (), {"url": d.get("file", ""), "file_id": d.get("file_id", ""), "name": d.get("name", "") or d.get("file", "")})()
+                result.append(obj)
             elif t == "forward":
                 obj = type("Forward", (), {"id": d.get("id", ""), "nodes": []})()
                 result.append(obj)
         return result
+
+    async def _extract_video_frames(self, video_url: str, frame_count: int = 6) -> list[str] | None:
+        """下载视频并用 ffmpeg 抽帧，返回帧图片路径列表。失败返回 None 并清理临时文件。"""
+        tmp_dir = None
+        try:
+            tmp_dir = tempfile.mkdtemp(prefix="video_frames_")
+            video_path = os.path.join(tmp_dir, "video.mp4")
+            # 下载
+            timeout = aiohttp.ClientTimeout(total=120)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(video_url) as resp:
+                    if resp.status != 200:
+                        logger.warning(f"AutoIssue: frame download failed HTTP {resp.status}")
+                        shutil.rmtree(tmp_dir)
+                        return None
+                    with open(video_path, "wb") as f:
+                        f.write(await resp.read())
+            # 获取时长
+            probe_cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                         "-of", "default=noprint_wrappers=1:nokey=1", video_path]
+            proc = subprocess.run(probe_cmd, capture_output=True, timeout=10)
+            duration = float(proc.stdout.decode().strip()) if proc.returncode == 0 and proc.stdout else 0
+            if duration <= 0:
+                logger.warning("AutoIssue: cannot determine video duration")
+                shutil.rmtree(tmp_dir)
+                return None
+            # ffmpeg 按时间间隔抽帧
+            interval = duration / (frame_count + 1)
+            frame_pattern = os.path.join(tmp_dir, "frame_%02d.png")
+            ffmpeg_cmd = [
+                "ffmpeg", "-y", "-i", video_path,
+                "-vf", f"fps=1/{interval:.1f}",
+                "-frames:v", str(frame_count),
+                frame_pattern,
+            ]
+            subprocess.run(ffmpeg_cmd, capture_output=True, timeout=30)
+            # 收集帧文件
+            frames = sorted(glob.glob(os.path.join(tmp_dir, "frame_*.png")))
+            if not frames:
+                logger.warning("AutoIssue: no frames extracted")
+                shutil.rmtree(tmp_dir)
+                return None
+            os.remove(video_path)  # 删掉视频只留帧
+            logger.info(f"AutoIssue: extracted {len(frames)} frames from {duration:.1f}s video")
+            return frames
+        except Exception as e:
+            logger.error(f"AutoIssue: frame extraction error: {e}")
+            if tmp_dir and os.path.exists(tmp_dir):
+                shutil.rmtree(tmp_dir)
+            return None
 
     async def _llm_format(self, content: str, media_urls: list, event) -> Optional[dict]:
         """返回 {"title": str, "body": str, "labels": list} 或 None。
@@ -370,8 +450,22 @@ class AutoIssuePlugin(Star):
                 logger.warning("AutoIssue: no LLM provider configured")
                 return None
             provider_id = prov.meta().id
-            # 提取所有 URL 传给 LLM（多模态模型可同时处理图片和视频）
-            all_urls = [url for _, url in media_urls]
+            # 视频：下载 + ffmpeg 抽帧 → 帧图片传入 image_urls
+            temp_dirs = []
+            image_urls = []
+            for kind, url in media_urls:
+                if not url.startswith("http"):
+                    continue
+                if kind == "视频":
+                    frame_paths = await self._extract_video_frames(url)
+                    if frame_paths:
+                        image_urls.extend(frame_paths)
+                        temp_dirs.append(os.path.dirname(frame_paths[0]))
+                        logger.info(f"AutoIssue: extracted {len(frame_paths)} frames from video")
+                    else:
+                        logger.warning(f"AutoIssue: frame extraction failed for video")
+                else:
+                    image_urls.append(url)
             prompt = (
                 "根据以下聊天内容，创建一个 GitHub Issue，严格遵循如下规则：\n\n"
                 "第一行必须输出类型标记（仅此一行，不加任何其他内容）：\n"
@@ -415,7 +509,7 @@ class AutoIssuePlugin(Star):
                 )
                 + f"---\n聊天内容：\n{content if content else '（无文字内容，请根据媒体内容分析）'}"
             )
-            logger.info(f"AutoIssue: calling LLM with {len(media_urls)} media(s), content_len={len(content)}")
+            logger.info(f"AutoIssue: calling LLM with {len(image_urls)} image(s), content_len={len(content)}")
             last_exc = None
             for attempt in range(3):
                 try:
@@ -423,7 +517,7 @@ class AutoIssuePlugin(Star):
                         self.context.llm_generate(
                             chat_provider_id=provider_id,
                             prompt=prompt,
-                            image_urls=all_urls if all_urls else None,
+                            image_urls=image_urls if image_urls else None,
                             system_prompt=self.llm_system_prompt or None,
                         ),
                         timeout=60,
@@ -470,6 +564,12 @@ class AutoIssuePlugin(Star):
         except Exception as e:
             logger.error(f"AutoIssue: LLM error: {e}")
             return None
+        finally:
+            for d in temp_dirs:
+                try:
+                    shutil.rmtree(d)
+                except Exception:
+                    pass
 
     async def _upload_video_to_repo(self, repo: str, video_url: str) -> Optional[str]:
         """下载视频并上传到仓库 .issue-assets/，返回 raw.githubusercontent.com URL。"""
