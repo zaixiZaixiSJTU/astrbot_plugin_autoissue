@@ -23,7 +23,7 @@ for _noisy in ("openai._base_client", "httpcore", "httpx"):
 from astrbot.api import logger
 from astrbot.api.event import filter
 from astrbot.api.star import Context, Star, StarTools, register
-from astrbot.api.message_components import At
+from astrbot.api.message_components import At, Image as ImageComp
 
 def _load_bindings(file_path: Path) -> dict:
     try:
@@ -131,6 +131,10 @@ class AutoIssuePlugin(Star):
         result = await self._create_issue(repo, issue_data)
         if result and result.startswith("https://"):
             yield event.plain_result(f"Issue created: {result}")
+            # 尝试用 Playwright 截取 issue 页面截图
+            screenshot_path = await self._capture_issue_screenshot(result)
+            if screenshot_path:
+                yield event.chain_result([ImageComp(str(screenshot_path))])
         else:
             yield event.plain_result(f"failed: {result or 'unknown'}")
 
@@ -627,6 +631,56 @@ class AutoIssuePlugin(Star):
             if tmp_path and os.path.exists(tmp_path):
                 os.remove(tmp_path)
                 logger.info(f"AutoIssue: cleaned up temp file {tmp_path}")
+
+    async def _capture_issue_screenshot(self, issue_url: str) -> Optional[str]:
+        """用 Playwright 截取 issue 页面截图，返回图片路径。失败返回 None。"""
+        try:
+            from playwright.async_api import async_playwright
+        except ImportError:
+            logger.warning("AutoIssue: playwright not installed, skip screenshot")
+            return None
+        wait_until = "domcontentloaded"
+        try:
+            async with async_playwright() as p:
+                browser = await p.chromium.launch()
+                context = await browser.new_context(
+                    viewport={"width": 850, "height": 1200},
+                    device_scale_factor=2,
+                )
+                page = await context.new_page()
+                try:
+                    await page.goto(issue_url, wait_until=wait_until, timeout=15000)
+                    await page.evaluate("""() => {
+                        const trash = ['header','footer','.AppHeader','.Layout-sidebar',
+                            '#partial-discussion-sidebar','.gh-header-actions','.gh-header-meta',
+                            '.js-sticky-header','.Layout-announcement'];
+                        trash.forEach(s => document.querySelectorAll(s).forEach(el => el.remove()));
+                        const main = document.querySelector('.Layout-main') || document.querySelector('#discussion_bucket');
+                        if (main) {
+                            let n = main;
+                            while (n && n !== document.body) {
+                                n.style.setProperty('width','100%','important');
+                                n.style.setProperty('max-width','none','important');
+                                n.style.setProperty('padding','0','important');
+                                n.style.setProperty('margin','0','important');
+                                n.style.setProperty('display','block','important');
+                                n = n.parentElement;
+                            }
+                        }
+                    }""")
+                    await page.wait_for_timeout(1000)
+                    total_h = await page.evaluate("document.documentElement.scrollHeight")
+                    await page.set_viewport_size({"width": 850, "height": total_h + 200})
+                    screenshot_dir = Path(tempfile.mkdtemp(prefix="issue_screenshot_"))
+                    screenshot_path = screenshot_dir / "issue.png"
+                    await page.screenshot(path=str(screenshot_path), full_page=True)
+                    logger.info(f"AutoIssue: screenshot saved -> {screenshot_path}")
+                    return str(screenshot_path)
+                finally:
+                    await browser.close()
+        except Exception as e:
+            logger.warning(f"AutoIssue: screenshot error: {e}")
+            return None
 
     async def _create_issue(self, repo: str, issue_data: dict) -> Optional[str]:
         owner, repo_name = repo.split("/", 1)
