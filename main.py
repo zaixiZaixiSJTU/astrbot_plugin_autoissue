@@ -11,6 +11,7 @@ import os
 import shutil
 import glob
 from pathlib import Path
+from datetime import datetime, timezone
 from typing import Optional
 
 import aiohttp
@@ -43,6 +44,29 @@ def _save_bindings(file_path: Path, bindings: dict) -> None:
         logger.error(f"AutoIssue: failed to save bindings: {e}")
 
 
+def _load_knowledge_bases(file_path: Path) -> dict:
+    """Load repository knowledge bases, ignoring malformed local data."""
+    try:
+        if file_path.exists():
+            data = json.loads(file_path.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return data
+    except Exception as e:
+        logger.warning(f"AutoIssue: failed to load knowledge bases: {e}")
+    return {}
+
+
+def _save_knowledge_bases(file_path: Path, knowledge_bases: dict) -> None:
+    try:
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        file_path.write_text(
+            json.dumps(knowledge_bases, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except Exception as e:
+        logger.error(f"AutoIssue: failed to save knowledge bases: {e}")
+
+
 @register(
     "astrbot_plugin_autoissue",
     "zaixiZaixiSJTU",
@@ -63,9 +87,13 @@ class AutoIssuePlugin(Star):
         self._bindings_lock = asyncio.Lock()
         self.repo_bindings: dict = _load_bindings(self._bindings_file)
 
+        self._knowledge_file: Path = StarTools.get_data_dir() / "repo_knowledge.json"
+        self._knowledge_lock = asyncio.Lock()
+        self.repo_knowledge: dict = _load_knowledge_bases(self._knowledge_file)
+
         logger.info(
             f"AutoIssue: init ok | token={'yes' if self.github_token else 'NO'} | "
-            f"bindings={len(self.repo_bindings)}"
+            f"bindings={len(self.repo_bindings)} | knowledge={len(self.repo_knowledge)}"
         )
 
     async def initialize(self):
@@ -77,7 +105,7 @@ class AutoIssuePlugin(Star):
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def on_message(self, event):
         msg_text: str = event.message_str or ""
-        logger.info(f"AutoIssue: on_message | msg={repr(msg_text)}")
+        # logger.info(f"AutoIssue: on_message | msg={repr(msg_text)}")
         if self.trigger_keyword not in msg_text:
             return
         if self.require_at_bot:
@@ -118,12 +146,15 @@ class AutoIssuePlugin(Star):
 
         yield event.plain_result("analyzing...")
 
+        # 绑定旧仓库或知识库文件被删除时，在实际创建 Issue 前自动补建。
+        knowledge = await self._ensure_repo_knowledge(repo)
+
         content, media_urls = await self._extract_quoted_content(event, group_id)
         if not content and not media_urls:
             yield event.plain_result("failed to extract quoted content")
             return
 
-        issue_data = await self._llm_format(content, media_urls, event)
+        issue_data = await self._llm_format(content, media_urls, event, knowledge)
         if not issue_data:
             yield event.plain_result("LLM failed to generate issue content")
             return
@@ -164,7 +195,9 @@ class AutoIssuePlugin(Star):
             self.repo_bindings[gid] = repo
             _save_bindings(self._bindings_file, self.repo_bindings)
         logger.info(f"AutoIssue: bind {gid} -> {repo}")
-        yield event.plain_result(f"bound group {gid} -> {repo}")
+        knowledge = await self._ensure_repo_knowledge(repo)
+        knowledge_status = "knowledge base ready" if knowledge else "knowledge base pending (will retry when creating an Issue)"
+        yield event.plain_result(f"bound group {gid} -> {repo}\n{knowledge_status}")
 
     @filter.command("unbindrepo")
     async def cmd_unbind(self, event):
@@ -189,12 +222,17 @@ class AutoIssuePlugin(Star):
             return
         gid = self._extract_group_id(event.session_id)
         bound = self.repo_bindings.get(gid, "none") if gid else "?"
+        knowledge_ready = bool(
+            isinstance(bound, str)
+            and self.repo_knowledge.get(self._knowledge_key(bound))
+        )
         yield event.plain_result(
             f"AutoIssue status\n"
             f"token: {'ok' if self.github_token else 'MISSING'}\n"
             f"keyword: {self.trigger_keyword}\n"
             f"require @bot: {self.require_at_bot}\n"
             f"group({gid}): {bound}\n"
+            f"knowledge base: {'ready' if knowledge_ready else 'missing'}\n"
             f"total bindings: {len(self.repo_bindings)}"
         )
 
@@ -230,6 +268,130 @@ class AutoIssuePlugin(Star):
         except Exception:
             pass
         return False
+
+    @staticmethod
+    def _knowledge_key(repo: str) -> str:
+        return repo.strip().lower()
+
+    async def _fetch_repository_readme(
+        self, repo: str
+    ) -> tuple[Optional[str], Optional[str], Optional[str]]:
+        """Return (README text, git sha, error)."""
+        owner, name = repo.split("/", 1)
+        url = f"https://api.github.com/repos/{owner}/{name}/readme"
+        headers = {
+            "Authorization": f"Bearer {self.github_token}",
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "AstrBot-AutoIssue",
+        }
+        try:
+            timeout = aiohttp.ClientTimeout(total=20)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(
+                    url, headers=headers, proxy=self.http_proxy
+                ) as resp:
+                    if resp.status == 404:
+                        return None, None, "not_found"
+                    if resp.status != 200:
+                        return None, None, f"HTTP {resp.status}"
+                    data = await resp.json()
+
+                encoded = data.get("content")
+                if encoded and data.get("encoding") == "base64":
+                    raw = base64.b64decode(encoded)
+                    return raw.decode("utf-8", errors="replace"), data.get("sha"), None
+
+                # GitHub may omit inline content for unusually large README files.
+                download_url = data.get("download_url")
+                if download_url:
+                    async with session.get(
+                        download_url, headers=headers, proxy=self.http_proxy
+                    ) as download_resp:
+                        if download_resp.status == 200:
+                            return await download_resp.text(errors="replace"), data.get("sha"), None
+                        return None, None, f"download HTTP {download_resp.status}"
+                return None, None, "README content is empty"
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as e:
+            return None, None, str(e)
+
+    async def _summarize_repository_readme(
+        self, repo: str, readme: str
+    ) -> Optional[str]:
+        """Use the configured AstrBot provider to turn a README into compact context."""
+        try:
+            provider = self.context.get_using_provider()
+            if not provider:
+                return None
+            prompt = (
+                f"请阅读 GitHub 仓库 {repo} 的 README，并整理成供 Issue 分析使用的小型知识库。\n"
+                "只依据 README，不要猜测。用简洁中文 Markdown 总结以下内容：\n"
+                "1. 项目用途和核心能力；2. 主要功能/模块与结构；3. 关键术语、运行环境和依赖；"
+                "4. 常见使用流程；5. 提交 Bug 或功能建议时值得关注的约束。\n"
+                "控制在 1200 字以内；README 未提及的项目省略。\n\n"
+                f"--- README ---\n{readme[:60000]}"
+            )
+            response = await asyncio.wait_for(
+                self.context.llm_generate(
+                    chat_provider_id=provider.meta().id,
+                    prompt=prompt,
+                    system_prompt="你是严谨的软件仓库文档分析助手。",
+                ),
+                timeout=60,
+            )
+            summary = response.completion_text.strip()
+            return summary[:12000] if summary else None
+        except Exception as e:
+            logger.warning(f"AutoIssue: README analysis failed for {repo}: {e}")
+            return None
+
+    async def _ensure_repo_knowledge(self, repo: str) -> Optional[str]:
+        """Return cached repository context, creating it from README when missing."""
+        key = self._knowledge_key(repo)
+        cached = self.repo_knowledge.get(key)
+        if (
+            isinstance(cached, dict)
+            and cached.get("status") in ("analyzed", "no_readme")
+            and isinstance(cached.get("summary"), str)
+        ):
+            return cached["summary"]
+
+        async with self._knowledge_lock:
+            # Another concurrent Issue may have completed the build while waiting.
+            cached = self.repo_knowledge.get(key)
+            if (
+                isinstance(cached, dict)
+                and cached.get("status") in ("analyzed", "no_readme")
+                and isinstance(cached.get("summary"), str)
+            ):
+                return cached["summary"]
+
+            logger.info(f"AutoIssue: knowledge base missing, reading README for {repo}")
+            readme, readme_sha, error = await self._fetch_repository_readme(repo)
+            if error == "not_found":
+                summary = "该仓库没有可读取的 README，暂无额外仓库背景信息。"
+                status = "no_readme"
+            elif error or readme is None:
+                logger.warning(f"AutoIssue: failed to read README for {repo}: {error}")
+                return None
+            else:
+                summary = await self._summarize_repository_readme(repo, readme)
+                status = "analyzed"
+                if not summary:
+                    # The Issue flow can still benefit from documentation when README
+                    # analysis temporarily fails (for example, provider timeout).
+                    summary = "## README 原文摘录\n\n" + readme[:8000]
+                    status = "readme_excerpt"
+
+            self.repo_knowledge[key] = {
+                "repo": repo,
+                "status": status,
+                "readme_sha": readme_sha,
+                "summary": summary,
+                "generated_at": datetime.now(timezone.utc).isoformat(),
+            }
+            _save_knowledge_bases(self._knowledge_file, self.repo_knowledge)
+            logger.info(f"AutoIssue: knowledge base stored for {repo} ({status})")
+            return summary
 
     async def _extract_quoted_content(self, event, group_id: str = "") -> tuple[str, list]:
         """返回 (文本内容, media_urls)，media_urls 为 [(kind, url), ...] 列表。"""
@@ -449,9 +611,16 @@ class AutoIssuePlugin(Star):
                 shutil.rmtree(tmp_dir)
             return None
 
-    async def _llm_format(self, content: str, media_urls: list, event) -> Optional[dict]:
+    async def _llm_format(
+        self,
+        content: str,
+        media_urls: list,
+        event,
+        repo_knowledge: Optional[str] = None,
+    ) -> Optional[dict]:
         """返回 {"title": str, "body": str, "labels": list} 或 None。
         media_urls 为 [(kind, url), ...] 列表，kind 取 \"图片\" 或 \"视频\"。"""
+        temp_dirs = []
         try:
             # 使用全局默认 LLM provider，不依赖会话级别配置
             prov = self.context.get_using_provider()
@@ -460,7 +629,6 @@ class AutoIssuePlugin(Star):
                 return None
             provider_id = prov.meta().id
             # 视频：下载 + ffmpeg 抽帧 → 帧图片传入 image_urls
-            temp_dirs = []
             image_urls = []
             for kind, url in media_urls:
                 if not url.startswith("http"):
@@ -510,6 +678,12 @@ class AutoIssuePlugin(Star):
                 "<其他信息，图片用 Markdown 图片格式嵌入，视频可按需描述关键帧/场景，无则省略此节>\n\n"
                 "注意：聊天内容中标记为[图片N]或[视频N]的媒体已作为附件提供，请根据上下文将它们嵌入到合适的章节，"
                 "必须使用下方列出的真实URL，格式为 ![描述](URL)。\n\n"
+                + (
+                    "以下是目标仓库 README 生成的本地知识库。它只用于理解项目背景、术语和结构；"
+                    "若与聊天中明确描述的问题冲突，以聊天内容为准，也不要把知识库全文复制到 Issue。\n\n"
+                    f"--- 仓库知识库 ---\n{repo_knowledge}\n--- 仓库知识库结束 ---\n\n"
+                    if repo_knowledge else ""
+                )
                 + (
                     "媒体URL对应关系（直接使用这些URL，不要自行编造链接）：\n"
                     + "\n".join(f"[{kind}{i}] → {url}" for i, (kind, url) in enumerate(media_urls, 1))
@@ -567,7 +741,7 @@ class AutoIssuePlugin(Star):
                 "FEATURE": ["💡 Feature Request"],
                 "OTHER": ["auto-issue"],
             }
-            labels = labels_map.get(issue_type, ["auto-issue"])
+            labels = labels_map.get(issue_type, ["auto-issue"]) + ["🤖 Agent Generated"]
             title = self._extract_title(body)
             return {"title": title, "body": body, "labels": labels, "media_urls": media_urls}
         except Exception as e:
