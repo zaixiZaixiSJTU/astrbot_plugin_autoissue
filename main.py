@@ -223,9 +223,15 @@ class AutoIssuePlugin(Star):
         gid = self._extract_group_id(event.session_id)
         bound = self.repo_bindings.get(gid, "none") if gid else "?"
         knowledge_ready = bool(
-            isinstance(bound, str)
+            bound not in ("none", "?")
             and self.repo_knowledge.get(self._knowledge_key(bound))
         )
+        if bound not in ("none", "?") and not knowledge_ready:
+            # 状态检查同时负责修复旧绑定或被删除的知识库缓存。
+            await self._ensure_repo_knowledge(bound)
+            knowledge_ready = bool(
+                self.repo_knowledge.get(self._knowledge_key(bound))
+            )
         yield event.plain_result(
             f"AutoIssue status\n"
             f"token: {'ok' if self.github_token else 'MISSING'}\n"
