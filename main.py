@@ -478,7 +478,9 @@ class AutoIssuePlugin(Star):
                         if not (resolved_url and isinstance(resolved_url, str) and resolved_url.startswith("http")):
                             resolved_url = None
                     except Exception as e:
-                        logger.warning(f"AutoIssue: get_group_file_url failed for {file_id}: {e}")
+                        logger.warning(
+                            f"AutoIssue: get_group_file_url failed for {file_id}: {e}"
+                        )
                 if resolved_url:
                     media_urls.append(("视频", resolved_url))
                     lines.append(f"[视频{len(media_urls)}]")
@@ -486,11 +488,16 @@ class AutoIssuePlugin(Star):
                     lines.append(f"[文件: {name}]")
             elif ctype in ("Forward", "MergedForward"):
                 # 合并转发：先尝试取内嵌节点，无则通过 API 拉取
-                nodes = (
+                raw_nodes = (
                     getattr(comp, "nodes", None)
                     or getattr(comp, "node_list", None)
+                    or getattr(comp, "content", None)
+                    or getattr(comp, "message", None)
                     or []
                 )
+                # NapCat embeds nested forwards in data.content. Inner forward
+                # ids cannot always be fetched separately, so prefer that data.
+                nodes = self._normalize_forward_nodes(raw_nodes)
                 if not nodes:
                     nodes = await self._fetch_forward_nodes(comp, bot)
                 for node in nodes:
@@ -498,20 +505,176 @@ class AutoIssuePlugin(Star):
                         getattr(node, "sender_name", None)
                         or getattr(node, "name", None)
                         or getattr(node, "nickname", None)
-                        or (node.get("sender", {}).get("nickname") if isinstance(node, dict) else None)
+                        or (
+                            node.get("sender", {}).get("nickname")
+                            if isinstance(node, dict)
+                            else None
+                        )
+                        or (
+                            str(node.get("sender", {}).get("user_id"))
+                            if isinstance(node, dict)
+                            and isinstance(node.get("sender"), dict)
+                            and node.get("sender", {}).get("user_id")
+                            else None
+                        )
                         or "unknown"
                     )
                     content = (
                         getattr(node, "content", None)
                         or getattr(node, "chain", None)
-                        or (node.get("content") if isinstance(node, dict) else None)
+                        or (
+                            node.get("message") or node.get("content")
+                            if isinstance(node, dict)
+                            else None
+                        )
                         or []
                     )
-                    node_lines, node_media = await self._extract_from_chain(content, bot=bot, depth=depth + 1, group_id=group_id)
+                    timestamp = (
+                        node.get("timestamp") or node.get("time") or node.get("send_time")
+                        if isinstance(node, dict)
+                        else getattr(node, "timestamp", None) or getattr(node, "time", None)
+                    )
+                    node_lines, node_media = await self._extract_from_chain(
+                        content, bot=bot, depth=depth + 1, group_id=group_id
+                    )
                     media_urls.extend(node_media)
                     if node_lines:
-                        lines.append(f"[{sender}]: " + " | ".join(node_lines))
+                        layer = depth + 1
+                        time_label = f" {timestamp}" if timestamp else ""
+                        lines.append(
+                            f"[转发第{layer}层{time_label}][{sender}]: "
+                            + " | ".join(node_lines)
+                        )
         return lines, media_urls
+
+    @staticmethod
+    def _unwrap_action_data(data):
+        """Accept both raw action data and a full OneBot response envelope."""
+        if not isinstance(data, dict):
+            return {}
+        wrapped = data.get("data")
+        return wrapped if isinstance(wrapped, dict) else data
+
+    @staticmethod
+    def _get_call_action(bot):
+        """Resolve call_action across AstrBot/NapCat adapter versions."""
+        direct = getattr(bot, "call_action", None)
+        if callable(direct):
+            return direct
+        api = getattr(bot, "api", None)
+        nested = getattr(api, "call_action", None)
+        return nested if callable(nested) else None
+
+    async def _call_action_with_message_id(self, bot, action: str, message_id):
+        """Call a OneBot action with compatible id names and scalar types."""
+        call_action = self._get_call_action(bot)
+        if not call_action:
+            return None
+
+        message_id_str = str(message_id).strip()
+        if not message_id_str:
+            return None
+        attempts = [{"message_id": message_id_str}, {"id": message_id_str}]
+        if message_id_str.isdigit():
+            numeric_id = int(message_id_str)
+            attempts.extend([{"message_id": numeric_id}, {"id": numeric_id}])
+
+        last_error = None
+        for params in attempts:
+            try:
+                return await call_action(action, **params)
+            except Exception as exc:
+                last_error = exc
+                logger.debug(f"AutoIssue: {action} failed with params={params}: {exc}")
+        if last_error:
+            raise last_error
+        return None
+
+    def _normalize_forward_nodes(self, nodes) -> list:
+        """Normalize NapCat message records and OneBot node segments."""
+        if isinstance(nodes, str):
+            try:
+                nodes = json.loads(nodes)
+            except Exception:
+                return []
+        if isinstance(nodes, dict):
+            # Adapters may return a response envelope or a single message node.
+            for key in ("data", "messages", "nodes", "nodeList"):
+                value = nodes.get(key)
+                if isinstance(value, (dict, list, str)):
+                    return self._normalize_forward_nodes(value)
+            if nodes.get("type") == "node" or any(
+                key in nodes for key in ("sender", "message", "content")
+            ):
+                nodes = [nodes]
+            elif isinstance(nodes.get("message"), list) and nodes["message"] and all(
+                isinstance(item, dict) and item.get("type") == "node"
+                for item in nodes["message"]
+            ):
+                return self._normalize_forward_nodes(nodes["message"])
+            else:
+                return []
+        if isinstance(nodes, tuple):
+            nodes = list(nodes)
+        if not isinstance(nodes, list):
+            return []
+
+        # Some OneBot-compatible implementations put a message-segment chain
+        # directly in forward.content instead of wrapping it in message records.
+        if nodes and all(
+            isinstance(item, (str, dict))
+            and (isinstance(item, str) or item.get("type") != "node")
+            and (
+                isinstance(item, str)
+                or not any(key in item for key in ("sender", "message", "content"))
+            )
+            for item in nodes
+        ):
+            return [
+                {
+                    "sender": {},
+                    "content": self._parse_raw_segments(nodes),
+                }
+            ]
+
+        result = []
+        for node in nodes:
+            if not isinstance(node, dict):
+                # AstrBot may already have converted inline nodes to components.
+                result.append(node)
+                continue
+
+            if node.get("type") == "node" and isinstance(node.get("data"), dict):
+                node_data = node["data"]
+                sender = {
+                    "nickname": node_data.get("nickname") or node_data.get("name"),
+                    "user_id": node_data.get("user_id") or node_data.get("uin"),
+                }
+                raw_content = node_data.get("message") or node_data.get("content") or []
+                timestamp = node_data.get("time") or node_data.get("timestamp") or node_data.get("send_time")
+            else:
+                sender = (
+                    node.get("sender") if isinstance(node.get("sender"), dict) else {}
+                )
+                raw_content = node.get("message") or node.get("content") or []
+                timestamp = node.get("time") or node.get("timestamp") or node.get("send_time")
+
+            if isinstance(raw_content, str):
+                try:
+                    raw_content = json.loads(raw_content)
+                except Exception:
+                    raw_content = [{"type": "text", "data": {"text": raw_content}}]
+            if isinstance(raw_content, list) and all(
+                isinstance(item, (str, dict)) for item in raw_content
+            ):
+                parsed = self._parse_raw_segments(raw_content)
+            elif isinstance(raw_content, list):
+                # Preserve AstrBot components that were already decoded by an adapter.
+                parsed = raw_content
+            else:
+                parsed = []
+            result.append({"sender": sender, "content": parsed, "timestamp": timestamp})
+        return result
 
     async def _fetch_forward_nodes(self, comp, bot) -> list:
         """通过 get_forward_msg API 拉取合并转发节点，返回可遍历的 node 列表。"""
@@ -519,25 +682,25 @@ class AutoIssuePlugin(Star):
         if not forward_id or not bot:
             return []
         try:
-            data = await bot.call_action("get_forward_msg", message_id=forward_id)
-            messages = data.get("messages") or data.get("message") or []
-            # 将原始 dict 节点转换为统一结构，使 _extract_from_chain 能处理
-            result = []
-            for msg in messages:
-                sender = msg.get("sender", {}).get("nickname") or str(msg.get("sender", {}).get("user_id", "unknown"))
-                # NapCat/LLOneBot 返回的字段是 "message"，部分实现用 "content"
-                content_segs = msg.get("message") or msg.get("content") or []
-                # 若 content 是字符串（部分实现），尝试 JSON 解析
-                if isinstance(content_segs, str):
-                    try:
-                        content_segs = json.loads(content_segs)
-                    except Exception:
-                        content_segs = [{"type": "text", "data": {"text": content_segs}}]
-                # 构造轻量 dict node，用 sender 和已解析的段列表
-                parsed = self._parse_raw_segments(content_segs)
-                result.append({"sender": {"nickname": sender}, "content": parsed})
-            logger.info(f"AutoIssue: fetched {len(result)} nodes from forward {forward_id}")
-            logger.debug(f"AutoIssue: forward raw keys sample: {list(messages[0].keys()) if messages else []}")
+            data = await self._call_action_with_message_id(
+                bot, "get_forward_msg", forward_id
+            )
+            payload = self._unwrap_action_data(data)
+            messages = (
+                payload.get("messages")
+                or payload.get("message")
+                or payload.get("nodes")
+                or payload.get("nodeList")
+                or []
+            )
+            result = self._normalize_forward_nodes(messages)
+            logger.info(
+                f"AutoIssue: fetched {len(result)} nodes from forward {forward_id}"
+            )
+            logger.debug(
+                "AutoIssue: forward raw keys sample: "
+                f"{list(messages[0].keys()) if messages and isinstance(messages[0], dict) else []}"
+            )
             return result
         except Exception as e:
             logger.error(f"AutoIssue: get_forward_msg error: {e}")
@@ -547,23 +710,60 @@ class AutoIssuePlugin(Star):
     def _parse_raw_segments(segs: list) -> list:
         """将 OneBot 原始消息段列表转为可被 _extract_from_chain 识别的轻量对象列表。"""
         result = []
-        for seg in (segs or []):
+        for seg in segs or []:
+            if isinstance(seg, str):
+                result.append(type("Plain", (), {"text": seg})())
+                continue
+            if not isinstance(seg, dict):
+                continue
             t = seg.get("type", "")
             d = seg.get("data", {})
-            if t == "text":
+            if not isinstance(d, dict):
+                d = {}
+            if t in ("text", "plain"):
                 obj = type("Plain", (), {"text": d.get("text", "")})()
                 result.append(obj)
             elif t == "image":
-                obj = type("Image", (), {"url": d.get("url", "") or d.get("file", "")})()
+                obj = type(
+                    "Image", (), {"url": d.get("url", "") or d.get("file", "")}
+                )()
                 result.append(obj)
             elif t == "video":
-                obj = type("Video", (), {"url": d.get("url", "") or d.get("file", "")})()
+                obj = type(
+                    "Video", (), {"url": d.get("url", "") or d.get("file", "")}
+                )()
                 result.append(obj)
             elif t == "file":
-                obj = type("File", (), {"url": d.get("file", ""), "file_id": d.get("file_id", ""), "name": d.get("name", "") or d.get("file", "")})()
+                obj = type(
+                    "File",
+                    (),
+                    {
+                        "url": d.get("file", ""),
+                        "file_id": d.get("file_id", ""),
+                        "name": d.get("name", "") or d.get("file", ""),
+                    },
+                )()
                 result.append(obj)
-            elif t == "forward":
-                obj = type("Forward", (), {"id": d.get("id", ""), "nodes": []})()
+            elif t in ("forward", "forward_msg", "nodes"):
+                # Latest NapCat puts complete nested messages in data.content.
+                # Fetching an inner id separately may fail by design.
+                inline_nodes = (
+                    d.get("content") or d.get("message") or d.get("messages") or []
+                )
+                obj = type(
+                    "Forward",
+                    (),
+                    {
+                        "id": d.get("id", "") or d.get("message_id", ""),
+                        "content": inline_nodes,
+                        "nodes": [],
+                    },
+                )()
+                result.append(obj)
+            elif t == "node":
+                # Older NapCat versions can expose recursive results as node
+                # segments. Reuse the forward walker to retain sender metadata.
+                obj = type("Forward", (), {"id": "", "content": [seg], "nodes": []})()
                 result.append(obj)
         return result
 
